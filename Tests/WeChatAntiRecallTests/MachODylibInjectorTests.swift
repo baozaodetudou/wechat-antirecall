@@ -6,6 +6,11 @@ final class MachODylibInjectorTests: XCTestCase {
     private let arm64CPUType: Int32 = 0x0100000c
     private let segment64LoadCommand: UInt32 = 0x19
 
+    func testRuntimeInstallerSelectsBothArchitecturesForBuild269341() {
+        XCTAssertEqual(RuntimeTipInstaller.architectures(for: "269341"), [.arm64, .x86_64])
+        XCTAssertEqual(RuntimeTipInstaller.architectures(for: "269340"), [.arm64])
+    }
+
     func testInjectsLoadDylibIntoThinMachOHeaderPadding() throws {
         let url = try makeTemporaryMachO()
 

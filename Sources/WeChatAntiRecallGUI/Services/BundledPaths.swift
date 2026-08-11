@@ -18,7 +18,7 @@ enum BundledPaths {
         // .build/<config>/WeChatAntiRecallGUI -> repo root is 3 levels up from the binary dir.
         URL(fileURLWithPath: CommandLine.arguments[0])
             .deletingLastPathComponent()   // release/
-            .deletingLastPathComponent()   // arm64-apple-macosx/ or debug/
+            .deletingLastPathComponent()   // arch/config parent or Products/
             .deletingLastPathComponent()   // .build/
             .deletingLastPathComponent()   // repo root
     }
@@ -30,6 +30,10 @@ enum BundledPaths {
             root.appendingPathComponent(".build/debug"),
             root.appendingPathComponent(".build/arm64-apple-macosx/release"),
             root.appendingPathComponent(".build/arm64-apple-macosx/debug"),
+            root.appendingPathComponent(".build/x86_64-apple-macosx/release"),
+            root.appendingPathComponent(".build/x86_64-apple-macosx/debug"),
+            root.appendingPathComponent(".build/apple/Products/Release"),
+            root.appendingPathComponent(".build/apple/Products/Debug"),
         ]
     }
 

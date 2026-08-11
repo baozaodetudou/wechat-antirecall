@@ -7,6 +7,29 @@ import WeChatAntiRecallRuntime
 /// (stub encoding, slot resolution, trampoline dispatch) in isolation.
 final class InlineHookEngineTests: XCTestCase {
 
+#if arch(x86_64)
+    func testX8664EntryStubRoundTripMatchesBuild269341Catalog() throws {
+        var bytes = [UInt8](repeating: 0, count: 6)
+        XCTAssertEqual(
+            wechat_antirecall_encode_x86_64_entry_stub(0x4d34650, 0xa53ff00, &bytes),
+            1
+        )
+        XCTAssertEqual(bytes.map { String(format: "%02X", $0) }.joined(), "FF25AAB88005")
+        XCTAssertEqual(
+            wechat_antirecall_decode_x86_64_entry_stub_slot(&bytes, 0x4d34650),
+            0xa53ff00
+        )
+    }
+
+    func testX8664InlineHookDispatchesThroughHookAndOriginal() {
+        XCTAssertEqual(wechat_antirecall_x86_64_inline_hook_selftest(), 1)
+    }
+
+    func testX8664MessageCaptureTrampolinePreservesDisplacedLoad() {
+        XCTAssertEqual(wechat_antirecall_x86_64_message_capture_inline_hook_selftest(), 1)
+    }
+#endif
+
     /// The encoder must produce an `adrp x16 / ldr x16 / br x16` stub that the
     /// decoder resolves back to exactly the requested slot address, across a
     /// range of page deltas and in-page offsets.
@@ -93,6 +116,7 @@ final class InlineHookEngineTests: XCTestCase {
     /// inline hook through the production engine, call it, and confirm the hook fired
     /// AND that invoking the captured original still runs the real body. The fake
     /// body returns 0x11; the hook adds 0x100, so a correct install yields 0x111.
+#if arch(arm64)
     func testInlineHookSelfTestDispatchesThroughHookAndOriginal() throws {
         XCTAssertEqual(
             wechat_antirecall_inline_hook_selftest(), 1,
@@ -106,4 +130,5 @@ final class InlineHookEngineTests: XCTestCase {
             "269340/269341 Message-finalizer trampoline did not preserve the ccmp flags"
         )
     }
+#endif
 }

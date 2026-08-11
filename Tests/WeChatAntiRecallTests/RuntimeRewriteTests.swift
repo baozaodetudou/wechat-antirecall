@@ -170,7 +170,7 @@ final class RuntimeRewriteTests: XCTestCase {
                 homeDirectory: homeDirectory,
                 bundleIdentifier: "com.tencent.xinWeChat.antirecall.clone1"
             ),
-            "已拦截一条撤回消息"
+            "已拦截 {from} 撤回的消息：{content}"
         )
     }
 
@@ -191,7 +191,7 @@ final class RuntimeRewriteTests: XCTestCase {
     func testFallsBackToNaturalDefaultPhraseWhenPreferenceIsMissing() throws {
         let homeDirectory = try makeTemporaryDirectory()
 
-        XCTAssertEqual(try loadConfiguredPhrase(homeDirectory: homeDirectory), "已拦截一条撤回消息")
+        XCTAssertEqual(try loadConfiguredPhrase(homeDirectory: homeDirectory), "已拦截 {from} 撤回的消息：{content}")
     }
 
     func testFallsBackToNaturalDefaultPhraseWhenPreferenceIsInvalid() throws {
@@ -203,7 +203,7 @@ final class RuntimeRewriteTests: XCTestCase {
                 .appendingPathComponent("com.tencent.xinWeChat.plist")
         )
 
-        XCTAssertEqual(try loadConfiguredPhrase(homeDirectory: homeDirectory), "已拦截一条撤回消息")
+        XCTAssertEqual(try loadConfiguredPhrase(homeDirectory: homeDirectory), "已拦截 {from} 撤回的消息：{content}")
     }
 
     func testTargetsResourcesWechatDylibInsteadOfFrameworksStub() {
@@ -510,6 +510,53 @@ final class RuntimeRewriteTests: XCTestCase {
         XCTAssertNil(wechat_antirecall_lookup_revoke_content_for_test(0))
     }
 
+    func testIncomingRevokeNotificationRendersVisibleBannerText() throws {
+        wechat_antirecall_clear_revoke_content_cache()
+        defer { wechat_antirecall_clear_revoke_content_cache() }
+        wechat_antirecall_remember_revoke_content_for_test(9876543210123, "你好世界")
+        let xml = "<sysmsg type=\"revokemsg\"><revokemsg>"
+            + "<newmsgid>9876543210123</newmsgid>"
+            + "<replacemsg><![CDATA[\"张三\" 撤回了一条消息]]></replacemsg>"
+            + "</revokemsg></sysmsg>"
+
+        let result = try renderIncomingRevokeNotification(
+            msgType: 10002,
+            xml: xml,
+            phrase: "已拦截 {from} 撤回的消息：{content}"
+        )
+
+        XCTAssertTrue(result.didRender)
+        XCTAssertEqual(result.tip, "已拦截 张三 撤回的消息：你好世界")
+    }
+
+    func testIncomingSelfRecallStaysNative() throws {
+        let xml = "<sysmsg type=\"revokemsg\"><revokemsg>"
+            + "<newmsgid>42</newmsgid>"
+            + "<replacemsg><![CDATA[你撤回了一条消息]]></replacemsg>"
+            + "</revokemsg></sysmsg>"
+
+        let result = try renderIncomingRevokeNotification(
+            msgType: 10002,
+            xml: xml,
+            phrase: "已拦截 {from} 撤回的消息：{content}"
+        )
+
+        XCTAssertFalse(result.didRender)
+        XCTAssertEqual(result.tip, "")
+    }
+
+    func testOrdinarySystemMessageDoesNotRenderBanner() throws {
+        let content = "你已添加了张三，现在可以开始聊天了。"
+        let result = try renderIncomingRevokeNotification(
+            msgType: 10000,
+            xml: content,
+            phrase: "已拦截 {from} 撤回的消息：{content}"
+        )
+
+        XCTAssertFalse(result.didRender)
+        XCTAssertEqual(result.tip, "")
+    }
+
     func testReceivedTextPreviewTruncatesOnUTF8Boundary() throws {
         let long = String(repeating: "中", count: 200)  // 600 UTF-8 bytes, over the 240 cap
         let preview = try receivedPreview(msgType: 1, raw: long)
@@ -526,6 +573,25 @@ final class RuntimeRewriteTests: XCTestCase {
             wechat_antirecall_free(unwrapped)
         }
         return String(cString: unwrapped)
+    }
+
+    private func renderIncomingRevokeNotification(
+        msgType: UInt32,
+        xml: String,
+        phrase: String,
+        fallbackTime: String = "09:30"
+    ) throws -> (tip: String, didRender: Bool) {
+        var didRender: Int32 = 0
+        let pointer = wechat_antirecall_render_incoming_revoke_notification_tip_for_test(
+            msgType,
+            xml,
+            phrase,
+            fallbackTime,
+            &didRender
+        )
+        let unwrapped = try XCTUnwrap(pointer)
+        defer { wechat_antirecall_free(unwrapped) }
+        return (String(cString: unwrapped), didRender == 1)
     }
 
     private func renderEvent(

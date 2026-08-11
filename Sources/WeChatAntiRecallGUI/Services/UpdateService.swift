@@ -3,7 +3,7 @@ import CryptoKit
 
 // Repo the GUI pulls updates from and publishes releases to (confirmed with the user).
 enum Upstream {
-    static let owner = "fzlzjerry"
+    static let owner = "baozaodetudou"
     static let repo = "wechat-antirecall"
     static var patchesJSON: URL {
         URL(string: "https://raw.githubusercontent.com/\(owner)/\(repo)/main/patches.json")!

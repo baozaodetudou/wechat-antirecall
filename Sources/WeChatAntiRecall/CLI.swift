@@ -187,7 +187,7 @@ struct DylibInjectionReport {
 }
 
 struct RecallTipPhrase: Equatable {
-    static let defaultText = "已拦截一条撤回消息"
+    static let defaultText = "已拦截 {from} 撤回的消息：{content}"
     static let maximumLength = 120
 
     let text: String
@@ -1473,9 +1473,14 @@ struct RuntimeTipInstaller {
     static let destinationDylibPath = "Contents/Resources/\(dylibFileName)"
     static let supportedBuildVersions = ["268597", "268599", "268601", "268602", "268831", "268849", "268850", "268851", "269077", "269079", "269110", "269332", "269333", "269334", "269338", "269340", "269341"]
 
+    static func architectures(for buildVersion: String) -> [CPUArch] {
+        buildVersion == "269341" ? [.arm64, .x86_64] : [.arm64]
+    }
+
     let sourceDylibURL: URL
     let destinationDylibURL: URL
     let hostBinaryURL: URL
+    let architectures: [CPUArch]
 
     var destinationDylibRelativePath: String {
         Self.destinationDylibPath
@@ -1494,25 +1499,30 @@ struct RuntimeTipInstaller {
         sourceDylibURL = try Self.resolveSourceDylibURL(path: options.runtimeDylibPath)
         destinationDylibURL = appInfo.appURL.appendingPathComponent(Self.destinationDylibPath)
         hostBinaryURL = appInfo.appURL.appendingPathComponent(Self.hostBinaryPath)
+        architectures = Self.architectures(for: appInfo.buildVersion)
     }
 
     func install(dryRun: Bool) throws -> [DylibInjectionReport] {
-        let reports = try MachODylibInjector(fileURL: hostBinaryURL).inject(
-            installName: Self.installName,
-            arch: .arm64,
-            dryRun: true
-        )
+        let reports = try architectures.flatMap { arch in
+            try MachODylibInjector(fileURL: hostBinaryURL).inject(
+                installName: Self.installName,
+                arch: arch,
+                dryRun: true
+            )
+        }
 
         guard !dryRun else {
             return reports
         }
 
         try copyRuntimeDylib()
-        return try MachODylibInjector(fileURL: hostBinaryURL).inject(
-            installName: Self.installName,
-            arch: .arm64,
-            dryRun: false
-        )
+        return try architectures.flatMap { arch in
+            try MachODylibInjector(fileURL: hostBinaryURL).inject(
+                installName: Self.installName,
+                arch: arch,
+                dryRun: false
+            )
+        }
     }
 
     private static func resolveSourceDylibURL(path: String?) throws -> URL {
@@ -1532,7 +1542,11 @@ struct RuntimeTipInstaller {
             workingDirectory.appendingPathComponent(".build/release/\(Self.dylibFileName)"),
             workingDirectory.appendingPathComponent(".build/debug/\(Self.dylibFileName)"),
             workingDirectory.appendingPathComponent(".build/arm64-apple-macosx/release/\(Self.dylibFileName)"),
-            workingDirectory.appendingPathComponent(".build/arm64-apple-macosx/debug/\(Self.dylibFileName)")
+            workingDirectory.appendingPathComponent(".build/arm64-apple-macosx/debug/\(Self.dylibFileName)"),
+            workingDirectory.appendingPathComponent(".build/x86_64-apple-macosx/release/\(Self.dylibFileName)"),
+            workingDirectory.appendingPathComponent(".build/x86_64-apple-macosx/debug/\(Self.dylibFileName)"),
+            workingDirectory.appendingPathComponent(".build/apple/Products/Release/\(Self.dylibFileName)"),
+            workingDirectory.appendingPathComponent(".build/apple/Products/Debug/\(Self.dylibFileName)")
         ]
 
         if let url = candidates.first(where: { fileManager.isReadableFile(atPath: $0.path) }) {

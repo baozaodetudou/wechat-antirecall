@@ -366,14 +366,20 @@ final class PatchConfigTests: XCTestCase {
 
         XCTAssertEqual(config.targets.map(\.identifier), ["revoke", "revoke-tip", "update", "runtime-tip"])
         XCTAssertEqual(config.targets.first { $0.identifier == "revoke" }?.entries.first?.address, 0x462e87c)
-        XCTAssertEqual(config.targets.first { $0.identifier == "revoke-tip" }?.entries.map(\.address), [0x462e87c, 0x462f01c])
+        XCTAssertEqual(
+            config.targets.first { $0.identifier == "revoke-tip" }?.entries
+                .filter { $0.arch == .arm64 }
+                .map(\.address),
+            [0x462e87c, 0x462f01c]
+        )
 
         let update = try XCTUnwrap(config.targets.first { $0.identifier == "update" })
-        XCTAssertEqual(update.entries.map(\.address), [
+        let armUpdateEntries = update.entries.filter { $0.arch == .arm64 }
+        XCTAssertEqual(armUpdateEntries.map(\.address), [
             0x26e4c0, 0x2706ec, 0x2709bc, 0x270ddc,
             0x27b1d0, 0x27b1d8, 0x27b1e0, 0x27b1e8
         ])
-        XCTAssertTrue(update.entries.allSatisfy { $0.patchBytes.suffix(4) == (try! Data(hexString: "C0035FD6")) })
+        XCTAssertTrue(armUpdateEntries.allSatisfy { $0.patchBytes.suffix(4) == (try! Data(hexString: "C0035FD6")) })
 
         let runtimeTip = try XCTUnwrap(config.targets.first { $0.identifier == "runtime-tip" })
         XCTAssertEqual(runtimeTip.entries[0].address, 0x462e60c)
@@ -383,6 +389,46 @@ final class PatchConfigTests: XCTestCase {
         XCTAssertEqual(runtimeTip.entries[1].expectedBytes, [try Data(hexString: "084049391F0500712008407A")])
         XCTAssertEqual(runtimeTip.entries[1].patchBytes, try Data(hexString: "90A602B0108647F900021FD6"))
         XCTAssertTrue(RuntimeTipInstaller.supportedBuildVersions.contains("269341"))
+    }
+
+    func testBuild269341IncludesVerifiedIntelPatchEntries() throws {
+        let configs = try loadPatchConfigs()
+        let config = try XCTUnwrap(configs.first { $0.version == "269341" })
+
+        for identifier in ["revoke", "revoke-tip", "update", "runtime-tip"] {
+            let target = try XCTUnwrap(config.targets.first { $0.identifier == identifier })
+            XCTAssertTrue(
+                target.entries.contains { $0.arch == .x86_64 },
+                "269341 \(identifier) must contain an x86_64 entry"
+            )
+        }
+
+        let update = try XCTUnwrap(config.targets.first { $0.identifier == "update" })
+        let intelUpdateEntries = update.entries.filter { $0.arch == .x86_64 }
+        XCTAssertEqual(
+            intelUpdateEntries.map(\.address),
+            [0x2af4f0, 0x2b1b80, 0x2b1ea0, 0x2b2300, 0x2bd720, 0x2bd730, 0x2bd740, 0x2bd750]
+        )
+        XCTAssertEqual(
+            intelUpdateEntries.map(\.patchBytes),
+            [
+                try Data(hexString: "C3"), try Data(hexString: "C3"),
+                try Data(hexString: "C3"), try Data(hexString: "C3"),
+                try Data(hexString: "31C0C3"), try Data(hexString: "C3"),
+                try Data(hexString: "31C0C3"), try Data(hexString: "C3"),
+            ]
+        )
+
+        let runtimeTip = try XCTUnwrap(config.targets.first { $0.identifier == "runtime-tip" })
+        let intelEntries = runtimeTip.entries.filter { $0.arch == .x86_64 }
+        XCTAssertEqual(intelEntries.map(\.address), [0x4d34650, 0x4cc8b40])
+        XCTAssertEqual(
+            intelEntries.map(\.patchBytes),
+            [
+                try Data(hexString: "FF25AAB88005"),
+                try Data(hexString: "FF25C273870590"),
+            ]
+        )
     }
 
     private func loadPatchConfigs() throws -> [VersionConfig] {

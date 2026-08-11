@@ -27,7 +27,7 @@ jobs:
 
       - name: Build .app
         env:
-          ARCHS: "arm64"           # cosmetic-only universal is opt-in; see ci.yml canary
+          ARCHS: "arm64 x86_64"
           APP_VERSION: ${{ steps.ver.outputs.short }}
           APP_BUILD: ${{ github.run_number }}
         run: |
@@ -57,7 +57,7 @@ jobs:
 
           1. 下载并打开 DMG，把「微信防撤回」拖进「应用程序」。
           2. **首次打开**：在「应用程序」里右键点它 → 打开（因为未做 Apple 付费公证，直接双击会被拦截）。
-          3. 按界面提示开启防撤回。安装时会弹一次管理员密码。
+          3. 按界面提示授权并开启防撤回。
 
-          > 仅支持 Apple Silicon（M 系列）Mac。补丁只在已知微信构建号上生效；遇到新版微信，点「检查更新 → 拉取最新补丁数据」。
+          > 支持 Apple Silicon；Intel Mac 目前精确支持微信 4.1.12（构建号 269341）。Intel 的自定义提示显示为微信窗口顶部浮层，不写入聊天记录。
           NOTES

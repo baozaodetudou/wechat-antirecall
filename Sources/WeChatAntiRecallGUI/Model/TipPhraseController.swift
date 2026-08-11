@@ -13,7 +13,7 @@ final class TipPhraseController: ObservableObject {
     @Published var loadError: String?
 
     static let maxLength = 120
-    static let defaultPhrase = "已拦截一条撤回消息"
+    static let defaultPhrase = "已拦截 {from} 撤回的消息：{content}"
 
     // MARK: - Validation (mirrors RecallTipPhrase in the CLI)
 

@@ -1,8 +1,8 @@
 #!/bin/bash
 # Assembles WeChatAntiRecall.app from SwiftPM build products. Uses only system tools.
 #
-#   ARCHS="arm64"          (default) — matches reality: patches.json + dylib injection are arm64-only.
-#   ARCHS="arm64 x86_64"   universal — cosmetic; gated on the CI universal-compile canary.
+#   ARCHS="arm64 x86_64"   (default) — universal GUI, CLI and runtime dylib.
+#   ARCHS="arm64"          optional single-architecture developer build.
 #   CODESIGN_ID="-"        (default) — ad-hoc. Set to a Developer ID to sign properly.
 #
 # Output: dist/WeChatAntiRecall.app
@@ -15,26 +15,55 @@ APP_NAME="WeChatAntiRecall"
 GUI="WeChatAntiRecallGUI"
 CLI="wechat-antirecall"
 DYLIB="libWeChatAntiRecallRuntime.dylib"
-BUNDLE_ID="com.github.fzlzjerry.wechatantirecall"
+BUNDLE_ID="com.github.baozaodetudou.wechatantirecall"
 SIGN_ID="${CODESIGN_ID:--}"
-ARCHS="${ARCHS:-arm64}"
+ARCHS="${ARCHS:-arm64 x86_64}"
 SHORT_VERSION="${APP_VERSION:-1.0.0}"
 BUILD_NUMBER="${APP_BUILD:-1}"
 
 echo ">> Building ($ARCHS, release)..."
-FLAGS=(-c release)
-for a in $ARCHS; do FLAGS+=(--arch "$a"); done
-swift build "${FLAGS[@]}"
-BIN="$(swift build "${FLAGS[@]}" --show-bin-path)"
+ARM_BIN=""
+INTEL_BIN=""
+case "$ARCHS" in
+  arm64|"arm64 x86_64"|"x86_64 arm64")
+    swift build -c release --arch arm64
+    ARM_BIN="$(swift build -c release --arch arm64 --show-bin-path)"
+    ;;
+esac
+case "$ARCHS" in
+  x86_64|"arm64 x86_64"|"x86_64 arm64")
+    swift build -c release --arch x86_64
+    INTEL_BIN="$(swift build -c release --arch x86_64 --show-bin-path)"
+    ;;
+esac
+if [ -z "$ARM_BIN" ] && [ -z "$INTEL_BIN" ]; then
+  echo "ARCHS must be arm64, x86_64, or both" >&2
+  exit 1
+fi
+
+copy_product() {
+  PRODUCT="$1"
+  DESTINATION="$2"
+  if [ -n "$ARM_BIN" ] && [ -n "$INTEL_BIN" ]; then
+    lipo -create "$ARM_BIN/$PRODUCT" "$INTEL_BIN/$PRODUCT" -output "$DESTINATION"
+  elif [ -n "$ARM_BIN" ]; then
+    cp "$ARM_BIN/$PRODUCT" "$DESTINATION"
+  elif [ -n "$INTEL_BIN" ]; then
+    cp "$INTEL_BIN/$PRODUCT" "$DESTINATION"
+  else
+    echo "ARCHS must contain arm64 and/or x86_64" >&2
+    exit 1
+  fi
+}
 
 APP="$ROOT/dist/$APP_NAME.app"
 echo ">> Assembling ${APP}..."
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
-cp "$BIN/$GUI"          "$APP/Contents/MacOS/$GUI"
-cp "$BIN/$CLI"          "$APP/Contents/Resources/$CLI"
-cp "$BIN/$DYLIB"        "$APP/Contents/Resources/$DYLIB"
+copy_product "$GUI"     "$APP/Contents/MacOS/$GUI"
+copy_product "$CLI"     "$APP/Contents/Resources/$CLI"
+copy_product "$DYLIB"   "$APP/Contents/Resources/$DYLIB"
 cp "$ROOT/patches.json" "$APP/Contents/Resources/patches.json"
 
 ICON_KEY=""

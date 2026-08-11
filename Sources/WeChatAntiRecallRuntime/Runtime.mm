@@ -1,4 +1,5 @@
 #import <Foundation/Foundation.h>
+#import <AppKit/AppKit.h>
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
 #include <mach-o/dyld.h>
@@ -10,6 +11,7 @@
 #include <os/log.h>
 
 #include <cstdlib>
+#include <cstdint>
 #include <cstring>
 #include <mutex>
 #include <new>
@@ -56,6 +58,8 @@ constexpr RevokeHookConfig revokeHookConfigs[] = {
 // at `entryOffset` (overwritten by the static `adrp/ldr/br` stub at install time);
 // the trampoline replays them and jumps to `continuationOffset` (= entryOffset + 12).
 constexpr size_t inlineSavedInstructionCount = 3;
+constexpr size_t x86EntryStubLength = 6;
+constexpr size_t x86SavedBytesMaximumCount = 8;
 
 struct InlineRevokeHookConfig {
     const char *buildVersion;
@@ -75,6 +79,27 @@ struct InlineMessageCaptureHookConfig {
     const char *buildVersion;
     uintptr_t entryOffset;
     uint32_t savedInstructions[inlineSavedInstructionCount];
+    uintptr_t continuationOffset;
+    ptrdiff_t serverIdOffset;
+    ptrdiff_t msgTypeOffset;
+    ptrdiff_t contentOffset;
+};
+
+struct X86InlineRevokeHookConfig {
+    const char *buildVersion;
+    uintptr_t entryOffset;
+    uint8_t savedBytes[x86SavedBytesMaximumCount];
+    size_t savedByteCount;
+    uintptr_t continuationOffset;
+    ptrdiff_t newMsgIdOffset;
+    ptrdiff_t replaceMsgOffset;
+};
+
+struct X86InlineMessageCaptureHookConfig {
+    const char *buildVersion;
+    uintptr_t entryOffset;
+    uint8_t savedBytes[x86SavedBytesMaximumCount];
+    size_t savedByteCount;
     uintptr_t continuationOffset;
     ptrdiff_t serverIdOffset;
     ptrdiff_t msgTypeOffset;
@@ -206,13 +231,52 @@ constexpr InlineMessageCaptureHookConfig inlineMessageCaptureHookConfigs[] = {
     },
 };
 
+// Intel support is intentionally scoped to the locally verified WeChat 4.1.12
+// build 269341. The entry stubs are 6-byte RIP-relative indirect jumps into two
+// qword slots in the zero-filled tail of the x86_64 __DATA segment.
+constexpr X86InlineRevokeHookConfig x86InlineRevokeHookConfigs[] = {
+    {
+        "269341",
+        0x4d34650,
+        {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57}, // push rbp; mov rbp,rsp; push r15
+        6,
+        0x4d34656,
+        0x198,
+        0x1a0,
+    },
+};
+
+constexpr X86InlineMessageCaptureHookConfig x86InlineMessageCaptureHookConfigs[] = {
+    {
+        "269341",
+        0x4cc8b40,
+        {0x0f, 0xb6, 0x87, 0x50, 0x02, 0x00, 0x00}, // movzx eax,byte ptr [rdi+0x250]
+        7,
+        0x4cc8b47,
+        0x0f8,
+        0x00c,
+        0x130,
+    },
+};
+
 ParseRevokeXML originalParseRevokeXML = nullptr;
 FinalizeMessage originalFinalizeMessage = nullptr;
 const RevokeHookConfig *activeRevokeHookConfig = nullptr;
 const InlineMessageCaptureHookConfig *activeMessageCaptureHookConfig = nullptr;
+NSPanel *activeRevokeTipPanel = nil;
+uint64_t activeRevokeTipGeneration = 0;
 // Backing storage for the offsets used by hookedParseRevokeXML when the active hook
 // is an inline hook (the InlineRevokeHookConfig builds a compatible RevokeHookConfig).
 RevokeHookConfig activeInlineRevokeHookConfig = {nullptr, 0, 0, 0};
+InlineMessageCaptureHookConfig activeX86MessageCaptureHookConfig = {
+    nullptr,
+    0,
+    {0, 0, 0},
+    0,
+    0,
+    0,
+    0,
+};
 std::mutex revokeTimeCacheMutex;
 std::unordered_map<std::string, std::string> revokeTimeCache;
 // Maps a recalled message's newmsgid -> a short content preview captured by the
@@ -563,16 +627,26 @@ bool isTargetWeChatDylibPath(const char *imageName) {
 }
 
 std::string extractSenderName(const std::string &originalTip) {
+    const auto cleanSenderName = [](std::string sender) {
+        sender = trimCopy(sender);
+        if (sender.size() >= 2 &&
+            ((sender.front() == '"' && sender.back() == '"') ||
+             (sender.front() == '\'' && sender.back() == '\''))) {
+            sender = trimCopy(sender.substr(1, sender.size() - 2));
+        }
+        return sender;
+    };
+
     const std::string chineseMarker = "撤回";
     auto position = originalTip.find(chineseMarker);
     if (position != std::string::npos) {
-        return trimCopy(originalTip.substr(0, position));
+        return cleanSenderName(originalTip.substr(0, position));
     }
 
     const std::string englishMarker = " recalled ";
     position = originalTip.find(englishMarker);
     if (position != std::string::npos) {
-        auto sender = trimCopy(originalTip.substr(0, position));
+        auto sender = cleanSenderName(originalTip.substr(0, position));
         if (sender == "You") {
             return "";
         }
@@ -741,6 +815,19 @@ std::string xmlTagValue(const std::string &xml, const std::string &tagName) {
     }
 
     return xml.substr(valueStart, end - valueStart);
+}
+
+std::string xmlTextValue(const std::string &xml, const std::string &tagName) {
+    auto value = trimCopy(xmlTagValue(xml, tagName));
+    constexpr const char *cdataPrefix = "<![CDATA[";
+    constexpr const char *cdataSuffix = "]]>";
+    if (hasPrefix(value, cdataPrefix) && hasSuffix(value, cdataSuffix)) {
+        value = value.substr(
+            std::strlen(cdataPrefix),
+            value.size() - std::strlen(cdataPrefix) - std::strlen(cdataSuffix)
+        );
+    }
+    return trimCopy(value);
 }
 
 std::string formatUnixTimestamp(uint64_t timestamp) {
@@ -1038,6 +1125,204 @@ std::string renderRevokeTip(const std::string &originalTip, const std::string &c
     return renderRevokeTip(originalTip, configuredPhrase, currentTimeText(), "");
 }
 
+// Incoming revoke notifications are already ordinary network Message objects when
+// the common finalizer runs. The native Intel message pipeline discards these events
+// even when their raw XML is rewritten to a generic system message, so the runtime
+// renders a local, non-activating banner instead. The original Message remains byte-for-
+// byte intact and continues through WeChat's normal anti-recall path.
+bool isIncomingRevokeNotification(
+    void *message,
+    const InlineMessageCaptureHookConfig *config
+) {
+    if (message == nullptr || config == nullptr) {
+        return false;
+    }
+
+    const auto *msgType = reinterpret_cast<const uint32_t *>(
+        reinterpret_cast<const uint8_t *>(message) + config->msgTypeOffset
+    );
+    const auto *content = reinterpret_cast<const std::string *>(
+        reinterpret_cast<const uint8_t *>(message) + config->contentOffset
+    );
+    return isAddressRangeReadable(msgType, sizeof(*msgType)) &&
+        isAddressRangeReadable(content, sizeof(*content)) &&
+        (*msgType == 10000 || *msgType == 10002) &&
+        shouldInspectRevokeMessageFields(content);
+}
+
+bool renderIncomingRevokeNotificationTip(
+    void *message,
+    const InlineMessageCaptureHookConfig *config,
+    const std::string &configuredPhrase,
+    const std::string &fallbackTime,
+    std::string &renderedTip
+) {
+    if (configuredPhrase.empty() || !isIncomingRevokeNotification(message, config)) {
+        return false;
+    }
+
+    const auto *content = reinterpret_cast<const std::string *>(
+        reinterpret_cast<const uint8_t *>(message) + config->contentOffset
+    );
+    const std::string originalXML = *content;
+    const std::string originalTip = xmlTextValue(originalXML, "replacemsg");
+    if (originalTip.empty() || tipIndicatesSelfRecall(originalTip)) {
+        return false;
+    }
+
+    uint64_t contentKey = 0;
+    revokeNewMsgIdFromXML(&originalXML, contentKey);
+    std::string contentPreview;
+    lookupRevokeContentPreview(contentKey, contentPreview);
+    const auto timeText = stableRevokeTimeText(
+        contentKey,
+        &originalXML,
+        originalTip,
+        fallbackTime
+    );
+    renderedTip = renderRevokeTip(
+        originalTip,
+        configuredPhrase,
+        timeText,
+        contentPreview
+    );
+    return !renderedTip.empty();
+}
+
+void dismissActiveRevokeTipPanel() {
+    if (activeRevokeTipPanel == nil) {
+        return;
+    }
+
+    NSWindow *parent = activeRevokeTipPanel.parentWindow;
+    if (parent != nil) {
+        [parent removeChildWindow:activeRevokeTipPanel];
+    }
+    [activeRevokeTipPanel orderOut:nil];
+    [activeRevokeTipPanel close];
+#if !__has_feature(objc_arc)
+    [activeRevokeTipPanel release];
+#endif
+    activeRevokeTipPanel = nil;
+}
+
+NSWindow *bestRevokeTipAnchorWindow() {
+    NSWindow *anchor = NSApp.keyWindow;
+    if (anchor != nil && anchor.visible && anchor != activeRevokeTipPanel) {
+        return anchor;
+    }
+    anchor = NSApp.mainWindow;
+    if (anchor != nil && anchor.visible && anchor != activeRevokeTipPanel) {
+        return anchor;
+    }
+    for (NSWindow *window in NSApp.orderedWindows) {
+        if (window.visible && window != activeRevokeTipPanel && ![window isKindOfClass:NSPanel.class]) {
+            return window;
+        }
+    }
+    return nil;
+}
+
+void showVisibleRevokeTipBanner(const std::string &tip) {
+    if (tip.empty()) {
+        return;
+    }
+
+    NSString *tipText = [[NSString alloc] initWithBytes:tip.data()
+                                                length:tip.size()
+                                              encoding:NSUTF8StringEncoding];
+    if (tipText == nil) {
+        return;
+    }
+
+    dispatch_async(dispatch_get_main_queue(), ^{
+        @autoreleasepool {
+            dismissActiveRevokeTipPanel();
+            const uint64_t generation = ++activeRevokeTipGeneration;
+            NSWindow *anchor = bestRevokeTipAnchorWindow();
+            NSScreen *screen = anchor.screen ?: NSScreen.mainScreen;
+            const NSRect visibleFrame = screen == nil ? NSMakeRect(0, 0, 1440, 900) : screen.visibleFrame;
+            const CGFloat maximumWidth = MAX(280.0, MIN(460.0, visibleFrame.size.width - 32.0));
+            const CGFloat minimumWidth = MIN(320.0, maximumWidth);
+            NSFont *font = [NSFont systemFontOfSize:14.0 weight:NSFontWeightMedium];
+            const NSRect measured = [tipText boundingRectWithSize:NSMakeSize(maximumWidth - 40.0, 72.0)
+                                                           options:NSStringDrawingUsesLineFragmentOrigin |
+                                                                   NSStringDrawingUsesFontLeading
+                                                        attributes:@{NSFontAttributeName: font}];
+            const CGFloat panelWidth = MAX(minimumWidth, MIN(maximumWidth, ceil(measured.size.width) + 40.0));
+            const CGFloat panelHeight = MAX(52.0, MIN(96.0, ceil(measured.size.height) + 28.0));
+
+            NSPanel *panel = [[NSPanel alloc]
+                initWithContentRect:NSMakeRect(0, 0, panelWidth, panelHeight)
+                          styleMask:NSWindowStyleMaskBorderless | NSWindowStyleMaskNonactivatingPanel
+                            backing:NSBackingStoreBuffered
+                              defer:NO];
+            panel.opaque = NO;
+            panel.backgroundColor = NSColor.clearColor;
+            panel.hasShadow = YES;
+            panel.level = NSFloatingWindowLevel;
+            panel.hidesOnDeactivate = NO;
+            panel.ignoresMouseEvents = YES;
+            panel.releasedWhenClosed = NO;
+            panel.collectionBehavior = NSWindowCollectionBehaviorCanJoinAllSpaces |
+                                       NSWindowCollectionBehaviorFullScreenAuxiliary;
+
+            NSBox *background = [[NSBox alloc] initWithFrame:NSMakeRect(0, 0, panelWidth, panelHeight)];
+            background.boxType = NSBoxCustom;
+            background.borderWidth = 0;
+            background.borderColor = NSColor.clearColor;
+            background.cornerRadius = 12.0;
+            background.fillColor = [NSColor colorWithCalibratedWhite:0.08 alpha:0.92];
+
+            NSTextField *label = [[NSTextField alloc]
+                initWithFrame:NSMakeRect(20.0, 12.0, panelWidth - 40.0, panelHeight - 24.0)];
+            label.stringValue = tipText;
+            label.font = font;
+            label.textColor = NSColor.whiteColor;
+            label.alignment = NSTextAlignmentCenter;
+            label.editable = NO;
+            label.selectable = NO;
+            label.bezeled = NO;
+            label.drawsBackground = NO;
+            label.lineBreakMode = NSLineBreakByWordWrapping;
+            label.maximumNumberOfLines = 3;
+            [background addSubview:label];
+            panel.contentView = background;
+
+            NSRect referenceFrame = anchor == nil ? visibleFrame : anchor.frame;
+            CGFloat originX = NSMidX(referenceFrame) - panelWidth / 2.0;
+            CGFloat originY = NSMaxY(referenceFrame) - panelHeight - 48.0;
+            originX = MAX(NSMinX(visibleFrame) + 16.0,
+                          MIN(originX, NSMaxX(visibleFrame) - panelWidth - 16.0));
+            originY = MAX(NSMinY(visibleFrame) + 16.0,
+                          MIN(originY, NSMaxY(visibleFrame) - panelHeight - 16.0));
+            [panel setFrameOrigin:NSMakePoint(originX, originY)];
+
+            activeRevokeTipPanel = panel;
+            if (anchor != nil) {
+                [anchor addChildWindow:panel ordered:NSWindowAbove];
+                [panel orderFront:nil];
+            } else {
+                [panel orderFrontRegardless];
+            }
+
+#if !__has_feature(objc_arc)
+            [label release];
+            [background release];
+#endif
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 4 * NSEC_PER_SEC),
+                           dispatch_get_main_queue(), ^{
+                if (activeRevokeTipGeneration == generation) {
+                    dismissActiveRevokeTipPanel();
+                }
+            });
+        }
+    });
+#if !__has_feature(objc_arc)
+    [tipText release];
+#endif
+}
+
 NSString *revokeTipPreferenceKey() {
     return @"WeChatAntiRecall_RevokeTipPhrase";
 }
@@ -1047,7 +1332,7 @@ NSString *revokeTipDebugProbePreferenceKey() {
 }
 
 NSString *defaultRevokeTipPhrase() {
-    return @"已拦截一条撤回消息";
+    return @"已拦截 {from} 撤回的消息：{content}";
 }
 
 NSString *validPhraseOrNil(NSString *phrase) {
@@ -1480,6 +1765,24 @@ void hookedFinalizeMessage(void *message, int mode) {
     // The network-message constructor has already populated all three fields at this
     // point, while later handlers may normalize or replace the raw content.
     captureReceivedContentPreview(message, activeMessageCaptureHookConfig);
+
+    if (isIncomingRevokeNotification(message, activeMessageCaptureHookConfig)) {
+        @autoreleasepool {
+            const char *phrase = [configuredPhrase() UTF8String];
+            if (phrase != nullptr) {
+                std::string renderedTip;
+                if (renderIncomingRevokeNotificationTip(
+                    message,
+                    activeMessageCaptureHookConfig,
+                    phrase,
+                    currentTimeText(),
+                    renderedTip
+                )) {
+                    showVisibleRevokeTipBanner(renderedTip);
+                }
+            }
+        }
+    }
     originalFinalizeMessage(message, mode);
 }
 
@@ -1628,6 +1931,34 @@ uint64_t decodeEntryStubSlot(const uint32_t insns[3], uint64_t entryAddress) {
     return page + offset;
 }
 
+// x86_64: jmp qword ptr [rip+disp32]. The target is a writable qword SLOT whose
+// value is filled with the runtime hook address after dyld loads this library.
+bool encodeX86EntryStub(uint64_t entryAddress, uint64_t slotAddress, uint8_t out[x86EntryStubLength]) {
+    const int64_t displacement =
+        static_cast<int64_t>(slotAddress) - static_cast<int64_t>(entryAddress + x86EntryStubLength);
+    if (displacement < INT32_MIN || displacement > INT32_MAX) {
+        return false;
+    }
+
+    out[0] = 0xff;
+    out[1] = 0x25;
+    const int32_t encodedDisplacement = static_cast<int32_t>(displacement);
+    std::memcpy(out + 2, &encodedDisplacement, sizeof(encodedDisplacement));
+    return true;
+}
+
+uint64_t decodeX86EntryStubSlot(const uint8_t entry[x86EntryStubLength], uint64_t entryAddress) {
+    if (entry == nullptr || entry[0] != 0xff || entry[1] != 0x25) {
+        return 0;
+    }
+
+    int32_t displacement = 0;
+    std::memcpy(&displacement, entry + 2, sizeof(displacement));
+    return static_cast<uint64_t>(
+        static_cast<int64_t>(entryAddress + x86EntryStubLength) + displacement
+    );
+}
+
 // Map an executable copy of `byteCount` bytes from `bytes`. Prefers RW->mprotect(RX)
 // (works for non-hardened processes), falling back to MAP_JIT. Returns nullptr on
 // failure. `allocSize` receives the rounded page size for later munmap.
@@ -1656,6 +1987,33 @@ void *allocExecutableBytes(const void *bytes, size_t byteCount, size_t &allocSiz
     pthread_jit_write_protect_np(1);
     sys_icache_invalidate(region, byteCount);
     return region;
+}
+
+// Copy complete displaced x86_64 instructions and append an absolute indirect
+// jump (`ff 25 00 00 00 00; .quad continuation`). The jump preserves registers
+// and flags, so it is safe for both the ordinary prologue and the Message flag load.
+void *buildX86InlineTrampoline(
+    const uint8_t *savedBytes,
+    size_t savedByteCount,
+    uint64_t continuationAddress,
+    size_t &allocSize
+) {
+    if (savedBytes == nullptr || savedByteCount == 0 || savedByteCount > x86SavedBytesMaximumCount) {
+        allocSize = 0;
+        return nullptr;
+    }
+
+    constexpr size_t absoluteJumpByteCount = 6 + sizeof(uint64_t);
+    std::vector<uint8_t> buffer(savedByteCount + absoluteJumpByteCount, 0);
+    std::memcpy(buffer.data(), savedBytes, savedByteCount);
+    buffer[savedByteCount] = 0xff;
+    buffer[savedByteCount + 1] = 0x25;
+    std::memcpy(
+        buffer.data() + savedByteCount + 6,
+        &continuationAddress,
+        sizeof(continuationAddress)
+    );
+    return allocExecutableBytes(buffer.data(), buffer.size(), allocSize);
 }
 
 // Build a trampoline that replays the saved prologue then jumps to continuationAddress.
@@ -1691,6 +2049,30 @@ const InlineMessageCaptureHookConfig *inlineMessageCaptureHookConfigForBuild(con
         return nullptr;
     }
     for (const auto &config : inlineMessageCaptureHookConfigs) {
+        if (std::strcmp(config.buildVersion, buildVersion) == 0) {
+            return &config;
+        }
+    }
+    return nullptr;
+}
+
+const X86InlineRevokeHookConfig *x86InlineRevokeHookConfigForBuild(const char *buildVersion) {
+    if (buildVersion == nullptr) {
+        return nullptr;
+    }
+    for (const auto &config : x86InlineRevokeHookConfigs) {
+        if (std::strcmp(config.buildVersion, buildVersion) == 0) {
+            return &config;
+        }
+    }
+    return nullptr;
+}
+
+const X86InlineMessageCaptureHookConfig *x86InlineMessageCaptureHookConfigForBuild(const char *buildVersion) {
+    if (buildVersion == nullptr) {
+        return nullptr;
+    }
+    for (const auto &config : x86InlineMessageCaptureHookConfigs) {
         if (std::strcmp(config.buildVersion, buildVersion) == 0) {
             return &config;
         }
@@ -1816,6 +2198,111 @@ void installMessageCaptureInlineHook(
     }
 }
 
+void installX86RevokeTipInlineHook(
+    const WeChatDylibImage &image,
+    const X86InlineRevokeHookConfig *config
+) {
+    const uintptr_t entryAddress = image.slide + config->entryOffset;
+    if (!rangeContains(image.start, image.size, entryAddress, x86EntryStubLength) ||
+        !isAddressRangeReadable(reinterpret_cast<const void *>(entryAddress), x86EntryStubLength)) {
+        return;
+    }
+
+    uint8_t entryBytes[x86EntryStubLength];
+    std::memcpy(entryBytes, reinterpret_cast<const void *>(entryAddress), sizeof(entryBytes));
+    const uint64_t slotAddress = decodeX86EntryStubSlot(entryBytes, entryAddress);
+    if (slotAddress == 0 ||
+        !rangeContains(image.start, image.size, slotAddress, sizeof(void *)) ||
+        !isAddressRangeReadable(reinterpret_cast<const void *>(slotAddress), sizeof(void *))) {
+        return;
+    }
+
+    auto **slot = reinterpret_cast<void **>(slotAddress);
+    if (*slot == reinterpret_cast<void *>(&hookedParseRevokeXML)) {
+        return;
+    }
+
+    size_t trampolineAllocSize = 0;
+    void *trampoline = buildX86InlineTrampoline(
+        config->savedBytes,
+        config->savedByteCount,
+        image.slide + config->continuationOffset,
+        trampolineAllocSize
+    );
+    if (trampoline == nullptr) {
+        return;
+    }
+
+    originalParseRevokeXML = reinterpret_cast<ParseRevokeXML>(trampoline);
+    activeInlineRevokeHookConfig = RevokeHookConfig{
+        config->buildVersion,
+        config->entryOffset,
+        config->newMsgIdOffset,
+        config->replaceMsgOffset,
+    };
+    activeRevokeHookConfig = &activeInlineRevokeHookConfig;
+
+    if (!writeHookSlot(slot, reinterpret_cast<void *>(&hookedParseRevokeXML))) {
+        originalParseRevokeXML = nullptr;
+        activeRevokeHookConfig = nullptr;
+        munmap(trampoline, trampolineAllocSize);
+    }
+}
+
+void installX86MessageCaptureInlineHook(
+    const WeChatDylibImage &image,
+    const X86InlineMessageCaptureHookConfig *config
+) {
+    const uintptr_t entryAddress = image.slide + config->entryOffset;
+    if (!rangeContains(image.start, image.size, entryAddress, x86EntryStubLength) ||
+        !isAddressRangeReadable(reinterpret_cast<const void *>(entryAddress), x86EntryStubLength)) {
+        return;
+    }
+
+    uint8_t entryBytes[x86EntryStubLength];
+    std::memcpy(entryBytes, reinterpret_cast<const void *>(entryAddress), sizeof(entryBytes));
+    const uint64_t slotAddress = decodeX86EntryStubSlot(entryBytes, entryAddress);
+    if (slotAddress == 0 ||
+        !rangeContains(image.start, image.size, slotAddress, sizeof(void *)) ||
+        !isAddressRangeReadable(reinterpret_cast<const void *>(slotAddress), sizeof(void *))) {
+        return;
+    }
+
+    auto **slot = reinterpret_cast<void **>(slotAddress);
+    if (*slot == reinterpret_cast<void *>(&hookedFinalizeMessage)) {
+        return;
+    }
+
+    size_t trampolineAllocSize = 0;
+    void *trampoline = buildX86InlineTrampoline(
+        config->savedBytes,
+        config->savedByteCount,
+        image.slide + config->continuationOffset,
+        trampolineAllocSize
+    );
+    if (trampoline == nullptr) {
+        return;
+    }
+
+    originalFinalizeMessage = reinterpret_cast<FinalizeMessage>(trampoline);
+    activeX86MessageCaptureHookConfig = InlineMessageCaptureHookConfig{
+        config->buildVersion,
+        config->entryOffset,
+        {0, 0, 0},
+        config->continuationOffset,
+        config->serverIdOffset,
+        config->msgTypeOffset,
+        config->contentOffset,
+    };
+    activeMessageCaptureHookConfig = &activeX86MessageCaptureHookConfig;
+
+    if (!writeHookSlot(slot, reinterpret_cast<void *>(&hookedFinalizeMessage))) {
+        originalFinalizeMessage = nullptr;
+        activeMessageCaptureHookConfig = nullptr;
+        munmap(trampoline, trampolineAllocSize);
+    }
+}
+
 void installRevokeTipHook() {
     WeChatDylibImage image = {};
     if (!findWeChatDylibImage(image)) {
@@ -1823,6 +2310,14 @@ void installRevokeTipHook() {
     }
 
     const std::string buildVersion = currentBundleBuildVersion();
+#if defined(__x86_64__)
+    if (const auto *config = x86InlineRevokeHookConfigForBuild(buildVersion.c_str())) {
+        installX86RevokeTipInlineHook(image, config);
+    }
+    if (const auto *captureConfig = x86InlineMessageCaptureHookConfigForBuild(buildVersion.c_str())) {
+        installX86MessageCaptureInlineHook(image, captureConfig);
+    }
+#else
     if (const auto *config = revokeHookConfigForBuild(buildVersion.c_str())) {
         installRevokeTipStubHook(image, config);
     } else if (const auto *inlineConfig = inlineRevokeHookConfigForBuild(buildVersion.c_str())) {
@@ -1832,6 +2327,7 @@ void installRevokeTipHook() {
     if (const auto *captureConfig = inlineMessageCaptureHookConfigForBuild(buildVersion.c_str())) {
         installMessageCaptureInlineHook(image, captureConfig);
     }
+#endif
 }
 
 } // namespace
@@ -1948,6 +2444,46 @@ void wechat_antirecall_capture_received_content_for_test(
     content->~basic_string();
 }
 
+char *wechat_antirecall_render_incoming_revoke_notification_tip_for_test(
+    uint32_t inputMsgType,
+    const char *xml,
+    const char *configuredPhrase,
+    const char *fallbackTime,
+    int *didRender
+) {
+    constexpr ptrdiff_t serverIdOffset = 0x0f8;
+    constexpr ptrdiff_t msgTypeOffset = 0x00c;
+    constexpr ptrdiff_t contentOffset = 0x130;
+    alignas(std::string) uint8_t message[contentOffset + sizeof(std::string)] = {};
+    std::memcpy(message + msgTypeOffset, &inputMsgType, sizeof(inputMsgType));
+    const std::string rawXML = xml == nullptr ? "" : xml;
+    auto *content = new (message + contentOffset) std::string(rawXML);
+    const InlineMessageCaptureHookConfig config = {
+        "test",
+        0,
+        {0, 0, 0},
+        0,
+        serverIdOffset,
+        msgTypeOffset,
+        contentOffset,
+    };
+    std::string renderedTip;
+    const bool rendered = renderIncomingRevokeNotificationTip(
+        message,
+        &config,
+        configuredPhrase == nullptr ? "" : configuredPhrase,
+        fallbackTime == nullptr ? "" : fallbackTime,
+        renderedTip
+    );
+    char *result = copyCString(renderedTip.c_str());
+    content->~basic_string();
+
+    if (didRender != nullptr) {
+        *didRender = rendered ? 1 : 0;
+    }
+    return result;
+}
+
 void wechat_antirecall_free(void *pointer) {
     std::free(pointer);
 }
@@ -2006,6 +2542,17 @@ uint64_t wechat_antirecall_decode_entry_stub_slot(const uint8_t *entry, uint64_t
     uint32_t words[3];
     std::memcpy(words, entry, sizeof(words));
     return decodeEntryStubSlot(words, entryAddr);
+}
+
+int wechat_antirecall_encode_x86_64_entry_stub(uint64_t entryAddr, uint64_t slotAddr, uint8_t out[6]) {
+    if (out == nullptr) {
+        return 0;
+    }
+    return encodeX86EntryStub(entryAddr, slotAddr, out) ? 1 : 0;
+}
+
+uint64_t wechat_antirecall_decode_x86_64_entry_stub_slot(const uint8_t *entry, uint64_t entryAddr) {
+    return decodeX86EntryStubSlot(entry, entryAddr);
 }
 
 namespace {
@@ -2154,6 +2701,142 @@ int wechat_antirecall_message_capture_inline_hook_selftest(void) {
     }
 
     return equalResult == 0x111 && unequalResult == 0x122 ? 1 : 0;
+}
+
+int wechat_antirecall_x86_64_inline_hook_selftest(void) {
+#if !defined(__x86_64__)
+    return 1;
+#else
+    const size_t pageSize = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    void *region = mmap(nullptr, 2 * pageSize, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+    if (region == MAP_FAILED) {
+        return 0;
+    }
+
+    auto *codeRegion = static_cast<uint8_t *>(region);
+    auto *slotRegion = codeRegion + pageSize;
+    const uint64_t entryAddress = reinterpret_cast<uint64_t>(codeRegion);
+    const uint64_t slotAddress = reinterpret_cast<uint64_t>(slotRegion);
+
+    uint8_t stub[x86EntryStubLength];
+    if (!encodeX86EntryStub(entryAddress, slotAddress, stub)) {
+        munmap(region, 2 * pageSize);
+        return 0;
+    }
+
+    const uint8_t savedPrologue[] = {
+        0x55,                         // push rbp
+        0x48, 0x89, 0xe5,             // mov rbp,rsp
+        0x41, 0x57,                   // push r15
+    };
+    const uint8_t continuation[] = {
+        0xb8, 0x11, 0x00, 0x00, 0x00, // mov eax,0x11
+        0x41, 0x5f,                   // pop r15
+        0x5d,                         // pop rbp
+        0xc3,                         // ret
+    };
+    std::memcpy(codeRegion, stub, sizeof(stub));
+    std::memcpy(codeRegion + sizeof(stub), continuation, sizeof(continuation));
+    if (mprotect(codeRegion, pageSize, PROT_READ | PROT_EXEC) != 0) {
+        munmap(region, 2 * pageSize);
+        return 0;
+    }
+    sys_icache_invalidate(codeRegion, sizeof(stub) + sizeof(continuation));
+
+    size_t trampolineAllocSize = 0;
+    void *trampoline = buildX86InlineTrampoline(
+        savedPrologue,
+        sizeof(savedPrologue),
+        entryAddress + sizeof(stub),
+        trampolineAllocSize
+    );
+    if (trampoline == nullptr) {
+        munmap(region, 2 * pageSize);
+        return 0;
+    }
+
+    selftestOriginalFunction = reinterpret_cast<int (*)(void)>(trampoline);
+    *reinterpret_cast<void **>(slotRegion) = reinterpret_cast<void *>(&selftestHookedFunction);
+    const int result = reinterpret_cast<int (*)(void)>(codeRegion)();
+
+    selftestOriginalFunction = nullptr;
+    munmap(region, 2 * pageSize);
+    munmap(trampoline, trampolineAllocSize);
+    return result == 0x111 ? 1 : 0;
+#endif
+}
+
+int wechat_antirecall_x86_64_message_capture_inline_hook_selftest(void) {
+#if !defined(__x86_64__)
+    return 1;
+#else
+    const size_t pageSize = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    void *region = mmap(nullptr, 2 * pageSize, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+    if (region == MAP_FAILED) {
+        return 0;
+    }
+
+    auto *codeRegion = static_cast<uint8_t *>(region);
+    auto *slotRegion = codeRegion + pageSize;
+    const uint64_t entryAddress = reinterpret_cast<uint64_t>(codeRegion);
+    const uint64_t slotAddress = reinterpret_cast<uint64_t>(slotRegion);
+
+    uint8_t stub[x86EntryStubLength];
+    if (!encodeX86EntryStub(entryAddress, slotAddress, stub)) {
+        munmap(region, 2 * pageSize);
+        return 0;
+    }
+
+    // Exact first instruction from the 269341 x86_64 Message finalizer. The
+    // continuation branches on the loaded value, proving the trampoline replayed
+    // all seven bytes before returning to the original body.
+    const uint8_t savedLoad[] = {
+        0x0f, 0xb6, 0x87, 0x50, 0x02, 0x00, 0x00, // movzx eax,byte ptr [rdi+0x250]
+    };
+    const uint8_t continuation[] = {
+        0x3c, 0x01,                         // cmp al,1
+        0x75, 0x06,                         // jne unequal
+        0xb8, 0x11, 0x00, 0x00, 0x00,       // mov eax,0x11
+        0xc3,                               // ret
+        0xb8, 0x22, 0x00, 0x00, 0x00,       // unequal: mov eax,0x22
+        0xc3,                               // ret
+    };
+    std::memcpy(codeRegion, stub, sizeof(stub));
+    codeRegion[sizeof(stub)] = 0x90; // the static patch pads the 7th displaced byte
+    std::memcpy(codeRegion + sizeof(savedLoad), continuation, sizeof(continuation));
+    if (mprotect(codeRegion, pageSize, PROT_READ | PROT_EXEC) != 0) {
+        munmap(region, 2 * pageSize);
+        return 0;
+    }
+    sys_icache_invalidate(codeRegion, sizeof(savedLoad) + sizeof(continuation));
+
+    size_t trampolineAllocSize = 0;
+    void *trampoline = buildX86InlineTrampoline(
+        savedLoad,
+        sizeof(savedLoad),
+        entryAddress + sizeof(savedLoad),
+        trampolineAllocSize
+    );
+    if (trampoline == nullptr) {
+        munmap(region, 2 * pageSize);
+        return 0;
+    }
+
+    selftestOriginalConditionalFunction = reinterpret_cast<int (*)(void *, int)>(trampoline);
+    *reinterpret_cast<void **>(slotRegion) = reinterpret_cast<void *>(&selftestHookedConditionalFunction);
+
+    alignas(uint64_t) uint8_t fakeMessage[0x251] = {};
+    auto target = reinterpret_cast<int (*)(void *, int)>(codeRegion);
+    fakeMessage[0x250] = 1;
+    const int equalResult = target(fakeMessage, 0);
+    fakeMessage[0x250] = 0;
+    const int unequalResult = target(fakeMessage, 0);
+
+    selftestOriginalConditionalFunction = nullptr;
+    munmap(region, 2 * pageSize);
+    munmap(trampoline, trampolineAllocSize);
+    return equalResult == 0x111 && unequalResult == 0x122 ? 1 : 0;
+#endif
 }
 
 __attribute__((constructor))
