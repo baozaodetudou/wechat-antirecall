@@ -1,5 +1,4 @@
 #import <Foundation/Foundation.h>
-#import <AppKit/AppKit.h>
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
 #include <mach-o/dyld.h>
@@ -10,6 +9,7 @@
 #include <libkern/OSCacheControl.h>
 #include <os/log.h>
 
+#include <atomic>
 #include <cstdlib>
 #include <cstdint>
 #include <cstring>
@@ -36,6 +36,7 @@ constexpr size_t arm64StubLength = 16;
 // copied it into handlerOutput+0x1A0.
 using ParseRevokeXML = bool (*)(void *, std::string *, void *);
 using FinalizeMessage = void (*)(void *, int);
+using RevokeDeleteMethod = void (*)(void *);
 
 struct RevokeHookConfig {
     const char *buildVersion;
@@ -104,6 +105,11 @@ struct X86InlineMessageCaptureHookConfig {
     ptrdiff_t serverIdOffset;
     ptrdiff_t msgTypeOffset;
     ptrdiff_t contentOffset;
+};
+
+struct X86RevokeDeleteHookConfig {
+    const char *buildVersion;
+    uintptr_t callOffset;
 };
 
 constexpr InlineRevokeHookConfig inlineRevokeHookConfigs[] = {
@@ -232,8 +238,9 @@ constexpr InlineMessageCaptureHookConfig inlineMessageCaptureHookConfigs[] = {
 };
 
 // Intel support is intentionally scoped to the locally verified WeChat 4.1.12
-// build 269341. The entry stubs are 6-byte RIP-relative indirect jumps into two
-// qword slots in the zero-filled tail of the x86_64 __DATA segment.
+// build 269341. The entry stubs are 6-byte RIP-relative indirect jumps into qword
+// slots in the zero-filled tail of the x86_64 __DATA segment. A third slot rewrites
+// only OnMessageRevoke's delete call, allowing WeChat's native gray tip path to run.
 constexpr X86InlineRevokeHookConfig x86InlineRevokeHookConfigs[] = {
     {
         "269341",
@@ -259,12 +266,17 @@ constexpr X86InlineMessageCaptureHookConfig x86InlineMessageCaptureHookConfigs[]
     },
 };
 
+constexpr X86RevokeDeleteHookConfig x86RevokeDeleteHookConfigs[] = {
+    {"269341", 0x960601},
+};
+
 ParseRevokeXML originalParseRevokeXML = nullptr;
 FinalizeMessage originalFinalizeMessage = nullptr;
 const RevokeHookConfig *activeRevokeHookConfig = nullptr;
 const InlineMessageCaptureHookConfig *activeMessageCaptureHookConfig = nullptr;
-NSPanel *activeRevokeTipPanel = nil;
-uint64_t activeRevokeTipGeneration = 0;
+#if defined(__x86_64__)
+std::atomic_bool suppressNextRevokeDelete = false;
+#endif
 // Backing storage for the offsets used by hookedParseRevokeXML when the active hook
 // is an inline hook (the InlineRevokeHookConfig builds a compatible RevokeHookConfig).
 RevokeHookConfig activeInlineRevokeHookConfig = {nullptr, 0, 0, 0};
@@ -868,10 +880,10 @@ std::string timeTextFromXML(const std::string *xml) {
     return "";
 }
 
-// The real newmsgid carried by the revoke XML. The static str-xzr patch forces
-// message+0x168 to 0 (to keep the original message); for the user's own recalls we
-// restore this real id so WeChat deletes the original natively. Returns false if the
-// XML carries no usable newmsgid.
+// The real newmsgid carried by the revoke XML. arm64's static str-xzr patch clears
+// this field to preserve recalled content, while Intel keeps it so WeChat can build
+// its native gray tip and intercepts the later delete call instead. Self-recalls use
+// the real id on either path. Returns false if the XML carries no usable newmsgid.
 bool revokeNewMsgIdFromXML(const std::string *xml, uint64_t &result) {
     if (xml == nullptr || xml->empty()) {
         return false;
@@ -1125,203 +1137,7 @@ std::string renderRevokeTip(const std::string &originalTip, const std::string &c
     return renderRevokeTip(originalTip, configuredPhrase, currentTimeText(), "");
 }
 
-// Incoming revoke notifications are already ordinary network Message objects when
-// the common finalizer runs. The native Intel message pipeline discards these events
-// even when their raw XML is rewritten to a generic system message, so the runtime
-// renders a local, non-activating banner instead. The original Message remains byte-for-
-// byte intact and continues through WeChat's normal anti-recall path.
-bool isIncomingRevokeNotification(
-    void *message,
-    const InlineMessageCaptureHookConfig *config
-) {
-    if (message == nullptr || config == nullptr) {
-        return false;
-    }
 
-    const auto *msgType = reinterpret_cast<const uint32_t *>(
-        reinterpret_cast<const uint8_t *>(message) + config->msgTypeOffset
-    );
-    const auto *content = reinterpret_cast<const std::string *>(
-        reinterpret_cast<const uint8_t *>(message) + config->contentOffset
-    );
-    return isAddressRangeReadable(msgType, sizeof(*msgType)) &&
-        isAddressRangeReadable(content, sizeof(*content)) &&
-        (*msgType == 10000 || *msgType == 10002) &&
-        shouldInspectRevokeMessageFields(content);
-}
-
-bool renderIncomingRevokeNotificationTip(
-    void *message,
-    const InlineMessageCaptureHookConfig *config,
-    const std::string &configuredPhrase,
-    const std::string &fallbackTime,
-    std::string &renderedTip
-) {
-    if (configuredPhrase.empty() || !isIncomingRevokeNotification(message, config)) {
-        return false;
-    }
-
-    const auto *content = reinterpret_cast<const std::string *>(
-        reinterpret_cast<const uint8_t *>(message) + config->contentOffset
-    );
-    const std::string originalXML = *content;
-    const std::string originalTip = xmlTextValue(originalXML, "replacemsg");
-    if (originalTip.empty() || tipIndicatesSelfRecall(originalTip)) {
-        return false;
-    }
-
-    uint64_t contentKey = 0;
-    revokeNewMsgIdFromXML(&originalXML, contentKey);
-    std::string contentPreview;
-    lookupRevokeContentPreview(contentKey, contentPreview);
-    const auto timeText = stableRevokeTimeText(
-        contentKey,
-        &originalXML,
-        originalTip,
-        fallbackTime
-    );
-    renderedTip = renderRevokeTip(
-        originalTip,
-        configuredPhrase,
-        timeText,
-        contentPreview
-    );
-    return !renderedTip.empty();
-}
-
-void dismissActiveRevokeTipPanel() {
-    if (activeRevokeTipPanel == nil) {
-        return;
-    }
-
-    NSWindow *parent = activeRevokeTipPanel.parentWindow;
-    if (parent != nil) {
-        [parent removeChildWindow:activeRevokeTipPanel];
-    }
-    [activeRevokeTipPanel orderOut:nil];
-    [activeRevokeTipPanel close];
-#if !__has_feature(objc_arc)
-    [activeRevokeTipPanel release];
-#endif
-    activeRevokeTipPanel = nil;
-}
-
-NSWindow *bestRevokeTipAnchorWindow() {
-    NSWindow *anchor = NSApp.keyWindow;
-    if (anchor != nil && anchor.visible && anchor != activeRevokeTipPanel) {
-        return anchor;
-    }
-    anchor = NSApp.mainWindow;
-    if (anchor != nil && anchor.visible && anchor != activeRevokeTipPanel) {
-        return anchor;
-    }
-    for (NSWindow *window in NSApp.orderedWindows) {
-        if (window.visible && window != activeRevokeTipPanel && ![window isKindOfClass:NSPanel.class]) {
-            return window;
-        }
-    }
-    return nil;
-}
-
-void showVisibleRevokeTipBanner(const std::string &tip) {
-    if (tip.empty()) {
-        return;
-    }
-
-    NSString *tipText = [[NSString alloc] initWithBytes:tip.data()
-                                                length:tip.size()
-                                              encoding:NSUTF8StringEncoding];
-    if (tipText == nil) {
-        return;
-    }
-
-    dispatch_async(dispatch_get_main_queue(), ^{
-        @autoreleasepool {
-            dismissActiveRevokeTipPanel();
-            const uint64_t generation = ++activeRevokeTipGeneration;
-            NSWindow *anchor = bestRevokeTipAnchorWindow();
-            NSScreen *screen = anchor.screen ?: NSScreen.mainScreen;
-            const NSRect visibleFrame = screen == nil ? NSMakeRect(0, 0, 1440, 900) : screen.visibleFrame;
-            const CGFloat maximumWidth = MAX(280.0, MIN(460.0, visibleFrame.size.width - 32.0));
-            const CGFloat minimumWidth = MIN(320.0, maximumWidth);
-            NSFont *font = [NSFont systemFontOfSize:14.0 weight:NSFontWeightMedium];
-            const NSRect measured = [tipText boundingRectWithSize:NSMakeSize(maximumWidth - 40.0, 72.0)
-                                                           options:NSStringDrawingUsesLineFragmentOrigin |
-                                                                   NSStringDrawingUsesFontLeading
-                                                        attributes:@{NSFontAttributeName: font}];
-            const CGFloat panelWidth = MAX(minimumWidth, MIN(maximumWidth, ceil(measured.size.width) + 40.0));
-            const CGFloat panelHeight = MAX(52.0, MIN(96.0, ceil(measured.size.height) + 28.0));
-
-            NSPanel *panel = [[NSPanel alloc]
-                initWithContentRect:NSMakeRect(0, 0, panelWidth, panelHeight)
-                          styleMask:NSWindowStyleMaskBorderless | NSWindowStyleMaskNonactivatingPanel
-                            backing:NSBackingStoreBuffered
-                              defer:NO];
-            panel.opaque = NO;
-            panel.backgroundColor = NSColor.clearColor;
-            panel.hasShadow = YES;
-            panel.level = NSFloatingWindowLevel;
-            panel.hidesOnDeactivate = NO;
-            panel.ignoresMouseEvents = YES;
-            panel.releasedWhenClosed = NO;
-            panel.collectionBehavior = NSWindowCollectionBehaviorCanJoinAllSpaces |
-                                       NSWindowCollectionBehaviorFullScreenAuxiliary;
-
-            NSBox *background = [[NSBox alloc] initWithFrame:NSMakeRect(0, 0, panelWidth, panelHeight)];
-            background.boxType = NSBoxCustom;
-            background.borderWidth = 0;
-            background.borderColor = NSColor.clearColor;
-            background.cornerRadius = 12.0;
-            background.fillColor = [NSColor colorWithCalibratedWhite:0.08 alpha:0.92];
-
-            NSTextField *label = [[NSTextField alloc]
-                initWithFrame:NSMakeRect(20.0, 12.0, panelWidth - 40.0, panelHeight - 24.0)];
-            label.stringValue = tipText;
-            label.font = font;
-            label.textColor = NSColor.whiteColor;
-            label.alignment = NSTextAlignmentCenter;
-            label.editable = NO;
-            label.selectable = NO;
-            label.bezeled = NO;
-            label.drawsBackground = NO;
-            label.lineBreakMode = NSLineBreakByWordWrapping;
-            label.maximumNumberOfLines = 3;
-            [background addSubview:label];
-            panel.contentView = background;
-
-            NSRect referenceFrame = anchor == nil ? visibleFrame : anchor.frame;
-            CGFloat originX = NSMidX(referenceFrame) - panelWidth / 2.0;
-            CGFloat originY = NSMaxY(referenceFrame) - panelHeight - 48.0;
-            originX = MAX(NSMinX(visibleFrame) + 16.0,
-                          MIN(originX, NSMaxX(visibleFrame) - panelWidth - 16.0));
-            originY = MAX(NSMinY(visibleFrame) + 16.0,
-                          MIN(originY, NSMaxY(visibleFrame) - panelHeight - 16.0));
-            [panel setFrameOrigin:NSMakePoint(originX, originY)];
-
-            activeRevokeTipPanel = panel;
-            if (anchor != nil) {
-                [anchor addChildWindow:panel ordered:NSWindowAbove];
-                [panel orderFront:nil];
-            } else {
-                [panel orderFrontRegardless];
-            }
-
-#if !__has_feature(objc_arc)
-            [label release];
-            [background release];
-#endif
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 4 * NSEC_PER_SEC),
-                           dispatch_get_main_queue(), ^{
-                if (activeRevokeTipGeneration == generation) {
-                    dismissActiveRevokeTipPanel();
-                }
-            });
-        }
-    });
-#if !__has_feature(objc_arc)
-    [tipText release];
-#endif
-}
 
 NSString *revokeTipPreferenceKey() {
     return @"WeChatAntiRecall_RevokeTipPhrase";
@@ -1687,6 +1503,11 @@ char *copyNSString(NSString *value) {
 }
 
 bool hookedParseRevokeXML(void *message, std::string *xml, void *flag) {
+#if defined(__x86_64__)
+    // Fail open if parsing fails or the message layout is not the verified one: the
+    // later delete call must remain native unless this invocation proves otherwise.
+    suppressNextRevokeDelete.store(false, std::memory_order_release);
+#endif
     if (originalParseRevokeXML == nullptr) {
         return false;
     }
@@ -1715,10 +1536,9 @@ bool hookedParseRevokeXML(void *message, std::string *xml, void *flag) {
     const std::string originalReplaceMsg = *replaceMsg;
 
     // The local user's own recalls must look native (just WeChat's "You recalled a
-    // message" affordance). The static str-xzr patch unconditionally zeroed newMsgId,
-    // which keeps the original message and produces a duplicate line; restore the real
-    // newmsgid so WeChat deletes it normally, and leave the tip text untouched. Detect
-    // self-recalls from both the rendered tip and the raw <replacemsg> XML.
+    // message" affordance). Restore/retain the real newmsgid so WeChat deletes it
+    // normally, and leave the tip text untouched. Detect self-recalls from both the
+    // rendered tip and the raw <replacemsg> XML.
     const bool selfRecall =
         tipIndicatesSelfRecall(originalReplaceMsg) ||
         tipIndicatesSelfRecall(xmlTagValue(*xml, "replacemsg"));
@@ -1737,14 +1557,21 @@ bool hookedParseRevokeXML(void *message, std::string *xml, void *flag) {
             return result;
         }
 
+#if defined(__x86_64__)
+        // Intel 269341 keeps newMsgId intact so OnMessageRevoke can locate the
+        // recalled item and build WeChat's own gray system-message row. The patched
+        // delete call consumes this flag and skips only the actual deletion.
+        suppressNextRevokeDelete.store(true, std::memory_order_release);
+#endif
         const char *phrase = [configuredPhrase() UTF8String];
         if (phrase != nullptr) {
+#if !defined(__x86_64__)
             *newMsgId = 0;
+#endif
             const auto timeText = stableRevokeTimeText(originalNewMsgId, xml, originalReplaceMsg, currentTimeText());
-            // message+newMsgIdOffset was already zeroed by the static str-xzr patch
-            // before this hook ran, so use the real newmsgid carried by the XML to join against the
-            // content captured on the receive path. Empty on a cold-cache miss → {content}
-            // strips cleanly.
+            // Use the real newmsgid carried by the XML to join against the content
+            // captured on the receive path. Empty on a cold-cache miss → {content}
+            // strips cleanly. This works whether arm64 cleared the field or Intel kept it.
             uint64_t contentKey = 0;
             revokeNewMsgIdFromXML(xml, contentKey);
             std::string contentPreview;
@@ -1756,6 +1583,41 @@ bool hookedParseRevokeXML(void *message, std::string *xml, void *flag) {
     return result;
 }
 
+#if defined(__x86_64__)
+void callOriginalRevokeDelete(void *message) {
+    if (message == nullptr || !isAddressRangeReadable(message, sizeof(void *))) {
+        return;
+    }
+
+    auto **vtable = *reinterpret_cast<void ***>(message);
+    constexpr size_t deleteMethodOffset = 0xe0;
+    if (vtable == nullptr ||
+        !isAddressRangeReadable(
+            reinterpret_cast<const uint8_t *>(vtable) + deleteMethodOffset,
+            sizeof(void *)
+        )) {
+        return;
+    }
+
+    RevokeDeleteMethod method = nullptr;
+    std::memcpy(
+        &method,
+        reinterpret_cast<const uint8_t *>(vtable) + deleteMethodOffset,
+        sizeof(method)
+    );
+    if (method != nullptr) {
+        method(message);
+    }
+}
+
+void hookedRevokeDelete(void *message) {
+    const bool suppress = suppressNextRevokeDelete.exchange(false, std::memory_order_acq_rel);
+    if (!suppress) {
+        callOriginalRevokeDelete(message);
+    }
+}
+#endif
+
 void hookedFinalizeMessage(void *message, int mode) {
     if (originalFinalizeMessage == nullptr) {
         return;
@@ -1766,23 +1628,6 @@ void hookedFinalizeMessage(void *message, int mode) {
     // point, while later handlers may normalize or replace the raw content.
     captureReceivedContentPreview(message, activeMessageCaptureHookConfig);
 
-    if (isIncomingRevokeNotification(message, activeMessageCaptureHookConfig)) {
-        @autoreleasepool {
-            const char *phrase = [configuredPhrase() UTF8String];
-            if (phrase != nullptr) {
-                std::string renderedTip;
-                if (renderIncomingRevokeNotificationTip(
-                    message,
-                    activeMessageCaptureHookConfig,
-                    phrase,
-                    currentTimeText(),
-                    renderedTip
-                )) {
-                    showVisibleRevokeTipBanner(renderedTip);
-                }
-            }
-        }
-    }
     originalFinalizeMessage(message, mode);
 }
 
@@ -1959,6 +1804,20 @@ uint64_t decodeX86EntryStubSlot(const uint8_t entry[x86EntryStubLength], uint64_
     );
 }
 
+// x86_64: call qword ptr [rip+disp32]. This is deliberately decoded separately
+// from the entry jump so an unpatched vtable call can never be mistaken for a SLOT.
+uint64_t decodeX86IndirectCallSlot(const uint8_t entry[x86EntryStubLength], uint64_t callAddress) {
+    if (entry == nullptr || entry[0] != 0xff || entry[1] != 0x15) {
+        return 0;
+    }
+
+    int32_t displacement = 0;
+    std::memcpy(&displacement, entry + 2, sizeof(displacement));
+    return static_cast<uint64_t>(
+        static_cast<int64_t>(callAddress + x86EntryStubLength) + displacement
+    );
+}
+
 // Map an executable copy of `byteCount` bytes from `bytes`. Prefers RW->mprotect(RX)
 // (works for non-hardened processes), falling back to MAP_JIT. Returns nullptr on
 // failure. `allocSize` receives the rounded page size for later munmap.
@@ -2073,6 +1932,18 @@ const X86InlineMessageCaptureHookConfig *x86InlineMessageCaptureHookConfigForBui
         return nullptr;
     }
     for (const auto &config : x86InlineMessageCaptureHookConfigs) {
+        if (std::strcmp(config.buildVersion, buildVersion) == 0) {
+            return &config;
+        }
+    }
+    return nullptr;
+}
+
+const X86RevokeDeleteHookConfig *x86RevokeDeleteHookConfigForBuild(const char *buildVersion) {
+    if (buildVersion == nullptr) {
+        return nullptr;
+    }
+    for (const auto &config : x86RevokeDeleteHookConfigs) {
         if (std::strcmp(config.buildVersion, buildVersion) == 0) {
             return &config;
         }
@@ -2303,6 +2174,34 @@ void installX86MessageCaptureInlineHook(
     }
 }
 
+#if defined(__x86_64__)
+void installX86RevokeDeleteCallHook(
+    const WeChatDylibImage &image,
+    const X86RevokeDeleteHookConfig *config
+) {
+    const uintptr_t callAddress = image.slide + config->callOffset;
+    if (!rangeContains(image.start, image.size, callAddress, x86EntryStubLength) ||
+        !isAddressRangeReadable(reinterpret_cast<const void *>(callAddress), x86EntryStubLength)) {
+        return;
+    }
+
+    uint8_t callBytes[x86EntryStubLength];
+    std::memcpy(callBytes, reinterpret_cast<const void *>(callAddress), sizeof(callBytes));
+    const uint64_t slotAddress = decodeX86IndirectCallSlot(callBytes, callAddress);
+    if (slotAddress == 0 ||
+        !rangeContains(image.start, image.size, slotAddress, sizeof(void *)) ||
+        !isAddressRangeReadable(reinterpret_cast<const void *>(slotAddress), sizeof(void *))) {
+        return;
+    }
+
+    auto **slot = reinterpret_cast<void **>(slotAddress);
+    if (*slot == reinterpret_cast<void *>(&hookedRevokeDelete)) {
+        return;
+    }
+    writeHookSlot(slot, reinterpret_cast<void *>(&hookedRevokeDelete));
+}
+#endif
+
 void installRevokeTipHook() {
     WeChatDylibImage image = {};
     if (!findWeChatDylibImage(image)) {
@@ -2316,6 +2215,9 @@ void installRevokeTipHook() {
     }
     if (const auto *captureConfig = x86InlineMessageCaptureHookConfigForBuild(buildVersion.c_str())) {
         installX86MessageCaptureInlineHook(image, captureConfig);
+    }
+    if (const auto *deleteConfig = x86RevokeDeleteHookConfigForBuild(buildVersion.c_str())) {
+        installX86RevokeDeleteCallHook(image, deleteConfig);
     }
 #else
     if (const auto *config = revokeHookConfigForBuild(buildVersion.c_str())) {
@@ -2444,45 +2346,6 @@ void wechat_antirecall_capture_received_content_for_test(
     content->~basic_string();
 }
 
-char *wechat_antirecall_render_incoming_revoke_notification_tip_for_test(
-    uint32_t inputMsgType,
-    const char *xml,
-    const char *configuredPhrase,
-    const char *fallbackTime,
-    int *didRender
-) {
-    constexpr ptrdiff_t serverIdOffset = 0x0f8;
-    constexpr ptrdiff_t msgTypeOffset = 0x00c;
-    constexpr ptrdiff_t contentOffset = 0x130;
-    alignas(std::string) uint8_t message[contentOffset + sizeof(std::string)] = {};
-    std::memcpy(message + msgTypeOffset, &inputMsgType, sizeof(inputMsgType));
-    const std::string rawXML = xml == nullptr ? "" : xml;
-    auto *content = new (message + contentOffset) std::string(rawXML);
-    const InlineMessageCaptureHookConfig config = {
-        "test",
-        0,
-        {0, 0, 0},
-        0,
-        serverIdOffset,
-        msgTypeOffset,
-        contentOffset,
-    };
-    std::string renderedTip;
-    const bool rendered = renderIncomingRevokeNotificationTip(
-        message,
-        &config,
-        configuredPhrase == nullptr ? "" : configuredPhrase,
-        fallbackTime == nullptr ? "" : fallbackTime,
-        renderedTip
-    );
-    char *result = copyCString(renderedTip.c_str());
-    content->~basic_string();
-
-    if (didRender != nullptr) {
-        *didRender = rendered ? 1 : 0;
-    }
-    return result;
-}
 
 void wechat_antirecall_free(void *pointer) {
     std::free(pointer);
@@ -2553,6 +2416,55 @@ int wechat_antirecall_encode_x86_64_entry_stub(uint64_t entryAddr, uint64_t slot
 
 uint64_t wechat_antirecall_decode_x86_64_entry_stub_slot(const uint8_t *entry, uint64_t entryAddr) {
     return decodeX86EntryStubSlot(entry, entryAddr);
+}
+
+uint64_t wechat_antirecall_decode_x86_64_indirect_call_slot(const uint8_t *entry, uint64_t callAddr) {
+    return decodeX86IndirectCallSlot(entry, callAddr);
+}
+
+namespace {
+#if defined(__x86_64__)
+int revokeDeleteSelftestCallCount = 0;
+void revokeDeleteSelftestOriginal(void *) {
+    revokeDeleteSelftestCallCount += 1;
+}
+void *revokeDeleteSelftestArmOnWorker(void *) {
+    suppressNextRevokeDelete.store(true, std::memory_order_release);
+    return nullptr;
+}
+#endif
+} // namespace
+
+int wechat_antirecall_x86_64_revoke_delete_interceptor_selftest(void) {
+#if defined(__x86_64__)
+    constexpr size_t deleteMethodIndex = 0xe0 / sizeof(void *);
+    void *vtable[deleteMethodIndex + 1] = {};
+    vtable[deleteMethodIndex] = reinterpret_cast<void *>(&revokeDeleteSelftestOriginal);
+    struct FakeMessage {
+        void **vtable;
+    } message = {vtable};
+
+    revokeDeleteSelftestCallCount = 0;
+    suppressNextRevokeDelete.store(false, std::memory_order_release);
+    pthread_t worker = {};
+    if (pthread_create(&worker, nullptr, &revokeDeleteSelftestArmOnWorker, nullptr) != 0) {
+        return 0;
+    }
+    pthread_join(worker, nullptr);
+    hookedRevokeDelete(&message);
+    if (revokeDeleteSelftestCallCount != 0) {
+        return 0;
+    }
+    hookedRevokeDelete(&message);
+    if (revokeDeleteSelftestCallCount != 1) {
+        return 0;
+    }
+    suppressNextRevokeDelete.store(false, std::memory_order_release);
+    hookedRevokeDelete(&message);
+    return revokeDeleteSelftestCallCount == 2 ? 1 : 0;
+#else
+    return 0;
+#endif
 }
 
 namespace {

@@ -54,16 +54,6 @@ void wechat_antirecall_capture_received_content_for_test(
     const char *rawContent
 );
 
-// Exercises the production pre-finalizer render path: a revoke XML system message
-// becomes the text shown in the local non-activating banner. The original message is
-// never mutated. Caller owns the returned buffer (free with wechat_antirecall_free).
-char *wechat_antirecall_render_incoming_revoke_notification_tip_for_test(
-    uint32_t inputMsgType,
-    const char *xml,
-    const char *configuredPhrase,
-    const char *fallbackTime,
-    int *didRender
-);
 int wechat_antirecall_is_target_wechat_dylib_path(const char *imagePath);
 uintptr_t wechat_antirecall_revoke_hook_original_body_for_build(const char *buildVersion);
 int wechat_antirecall_should_inspect_revoke_message_fields(const char *xml);
@@ -96,6 +86,14 @@ uint64_t wechat_antirecall_decode_entry_stub_slot(const uint8_t *entry, uint64_t
 // resolves a writable function-pointer SLOT without clobbering registers or flags.
 int wechat_antirecall_encode_x86_64_entry_stub(uint64_t entryAddr, uint64_t slotAddr, uint8_t out[6]);
 uint64_t wechat_antirecall_decode_x86_64_entry_stub_slot(const uint8_t *entry, uint64_t entryAddr);
+
+// Decode `call qword ptr [rip+disp32]`, used by Intel 269341's selective revoke
+// deletion interceptor. A jump stub or unpatched virtual call returns 0.
+uint64_t wechat_antirecall_decode_x86_64_indirect_call_slot(const uint8_t *entry, uint64_t callAddr);
+
+// Verifies that the Intel revoke-delete interceptor suppresses one requested call,
+// consumes that decision, and otherwise dispatches the original vtable method.
+int wechat_antirecall_x86_64_revoke_delete_interceptor_selftest(void);
 
 // End-to-end self-test of the inline-hook engine WITHOUT WeChat: builds a fake
 // target carrying the parseRevokeXML prologue, installs the inline hook through the

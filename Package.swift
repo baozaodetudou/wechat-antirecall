@@ -28,8 +28,7 @@ let package = Package(
                 .unsafeFlags(["-std=gnu++17"])
             ],
             linkerSettings: [
-                .linkedFramework("Foundation"),
-                .linkedFramework("AppKit")
+                .linkedFramework("Foundation")
             ]
         ),
         .testTarget(
