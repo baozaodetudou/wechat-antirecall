@@ -87,14 +87,6 @@ uint64_t wechat_antirecall_decode_entry_stub_slot(const uint8_t *entry, uint64_t
 int wechat_antirecall_encode_x86_64_entry_stub(uint64_t entryAddr, uint64_t slotAddr, uint8_t out[6]);
 uint64_t wechat_antirecall_decode_x86_64_entry_stub_slot(const uint8_t *entry, uint64_t entryAddr);
 
-// Decode `call qword ptr [rip+disp32]`, used by Intel 269341's selective revoke
-// deletion interceptor. A jump stub or unpatched virtual call returns 0.
-uint64_t wechat_antirecall_decode_x86_64_indirect_call_slot(const uint8_t *entry, uint64_t callAddr);
-
-// Verifies that the Intel revoke-delete interceptor suppresses one requested call,
-// consumes that decision, and otherwise dispatches the original vtable method.
-int wechat_antirecall_x86_64_revoke_delete_interceptor_selftest(void);
-
 // End-to-end self-test of the inline-hook engine WITHOUT WeChat: builds a fake
 // target carrying the parseRevokeXML prologue, installs the inline hook through the
 // exact production path (encode stub -> overwrite entry -> build trampoline ->

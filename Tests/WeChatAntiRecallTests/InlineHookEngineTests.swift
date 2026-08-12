@@ -21,25 +21,6 @@ final class InlineHookEngineTests: XCTestCase {
         )
     }
 
-    func testX8664RevokeDeleteCallDecodesThirdRuntimeSlot() {
-        var bytes: [UInt8] = [0xFF, 0x15, 0x09, 0xF9, 0xBD, 0x09]
-        XCTAssertEqual(
-            wechat_antirecall_decode_x86_64_indirect_call_slot(&bytes, 0x960601),
-            0xa53ff10
-        )
-
-        bytes[1] = 0x25
-        XCTAssertEqual(
-            wechat_antirecall_decode_x86_64_indirect_call_slot(&bytes, 0x960601),
-            0,
-            "an entry jump must not be accepted as a call-site patch"
-        )
-    }
-
-    func testX8664RevokeDeleteInterceptorSuppressesOnlyOneRequestedDelete() {
-        XCTAssertEqual(wechat_antirecall_x86_64_revoke_delete_interceptor_selftest(), 1)
-    }
-
     func testX8664InlineHookDispatchesThroughHookAndOriginal() {
         XCTAssertEqual(wechat_antirecall_x86_64_inline_hook_selftest(), 1)
     }

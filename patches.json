@@ -1525,8 +1525,7 @@
           { "arch": "arm64", "addr": "462e60c", "expected": "F85FBCA9F65701A9F44F02A9", "asm": "90A302B0108247F900021FD6" },
           { "arch": "arm64", "addr": "45ce5b0", "expected": "084049391F0500712008407A", "asm": "90A602B0108647F900021FD6" },
           { "arch": "x86_64", "addr": "4d34650", "expected": "554889E54157", "asm": "FF25AAB88005" },
-          { "arch": "x86_64", "addr": "4cc8b40", "expected": "0FB68750020000", "asm": "FF25C273870590" },
-          { "arch": "x86_64", "addr": "960601", "expected": "FF90E0000000", "asm": "FF1509F9BD09" }
+          { "arch": "x86_64", "addr": "4cc8b40", "expected": "0FB68750020000", "asm": "FF25C273870590" }
         ]
       }
     ]

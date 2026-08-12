@@ -9,7 +9,6 @@
 #include <libkern/OSCacheControl.h>
 #include <os/log.h>
 
-#include <atomic>
 #include <cstdlib>
 #include <cstdint>
 #include <cstring>
@@ -36,7 +35,6 @@ constexpr size_t arm64StubLength = 16;
 // copied it into handlerOutput+0x1A0.
 using ParseRevokeXML = bool (*)(void *, std::string *, void *);
 using FinalizeMessage = void (*)(void *, int);
-using RevokeDeleteMethod = void (*)(void *);
 
 struct RevokeHookConfig {
     const char *buildVersion;
@@ -105,11 +103,6 @@ struct X86InlineMessageCaptureHookConfig {
     ptrdiff_t serverIdOffset;
     ptrdiff_t msgTypeOffset;
     ptrdiff_t contentOffset;
-};
-
-struct X86RevokeDeleteHookConfig {
-    const char *buildVersion;
-    uintptr_t callOffset;
 };
 
 constexpr InlineRevokeHookConfig inlineRevokeHookConfigs[] = {
@@ -239,8 +232,7 @@ constexpr InlineMessageCaptureHookConfig inlineMessageCaptureHookConfigs[] = {
 
 // Intel support is intentionally scoped to the locally verified WeChat 4.1.12
 // build 269341. The entry stubs are 6-byte RIP-relative indirect jumps into qword
-// slots in the zero-filled tail of the x86_64 __DATA segment. A third slot rewrites
-// only OnMessageRevoke's delete call, allowing WeChat's native gray tip path to run.
+// slots in the zero-filled tail of the x86_64 __DATA segment.
 constexpr X86InlineRevokeHookConfig x86InlineRevokeHookConfigs[] = {
     {
         "269341",
@@ -266,17 +258,10 @@ constexpr X86InlineMessageCaptureHookConfig x86InlineMessageCaptureHookConfigs[]
     },
 };
 
-constexpr X86RevokeDeleteHookConfig x86RevokeDeleteHookConfigs[] = {
-    {"269341", 0x960601},
-};
-
 ParseRevokeXML originalParseRevokeXML = nullptr;
 FinalizeMessage originalFinalizeMessage = nullptr;
 const RevokeHookConfig *activeRevokeHookConfig = nullptr;
 const InlineMessageCaptureHookConfig *activeMessageCaptureHookConfig = nullptr;
-#if defined(__x86_64__)
-std::atomic_bool suppressNextRevokeDelete = false;
-#endif
 // Backing storage for the offsets used by hookedParseRevokeXML when the active hook
 // is an inline hook (the InlineRevokeHookConfig builds a compatible RevokeHookConfig).
 RevokeHookConfig activeInlineRevokeHookConfig = {nullptr, 0, 0, 0};
@@ -881,8 +866,9 @@ std::string timeTextFromXML(const std::string *xml) {
 }
 
 // The real newmsgid carried by the revoke XML. arm64's static str-xzr patch clears
-// this field to preserve recalled content, while Intel keeps it so WeChat can build
-// its native gray tip and intercepts the later delete call instead. Self-recalls use
+// this field to preserve recalled content. Intel custom-tip mode keeps it so WeChat
+// can replace the recalled row with its native gray system notice; Intel silent mode
+// uses the separate branch patch and never loads this runtime hook. Self-recalls use
 // the real id on either path. Returns false if the XML carries no usable newmsgid.
 bool revokeNewMsgIdFromXML(const std::string *xml, uint64_t &result) {
     if (xml == nullptr || xml->empty()) {
@@ -1378,6 +1364,27 @@ bool debugProbeEnabled() {
     return debugProbeEnabledForHomeDirectory(nil);
 }
 
+#if defined(__x86_64__)
+void logIntelRevokeDecision(const char *stage, uint64_t newMsgId, bool suppress, const void *address = nullptr) {
+    if (!debugProbeEnabled()) {
+        return;
+    }
+
+    uint64_t threadId = 0;
+    pthread_threadid_np(nullptr, &threadId);
+    os_log(
+        OS_LOG_DEFAULT,
+        "[WeChatAntiRecallDecision] stage=%{public}s thread=%llu newmsgid=%llu suppress=%{public}s address=%p",
+        stage,
+        threadId,
+        newMsgId,
+        suppress ? "true" : "false",
+        address
+    );
+}
+
+#endif
+
 std::string previewString(const std::string &value) {
     auto preview = value;
     replaceAll(preview, "\n", "\\n");
@@ -1503,11 +1510,6 @@ char *copyNSString(NSString *value) {
 }
 
 bool hookedParseRevokeXML(void *message, std::string *xml, void *flag) {
-#if defined(__x86_64__)
-    // Fail open if parsing fails or the message layout is not the verified one: the
-    // later delete call must remain native unless this invocation proves otherwise.
-    suppressNextRevokeDelete.store(false, std::memory_order_release);
-#endif
     if (originalParseRevokeXML == nullptr) {
         return false;
     }
@@ -1535,6 +1537,10 @@ bool hookedParseRevokeXML(void *message, std::string *xml, void *flag) {
     const uint64_t originalNewMsgId = *newMsgId;
     const std::string originalReplaceMsg = *replaceMsg;
 
+#if defined(__x86_64__)
+    logIntelRevokeDecision("parse-inspected", originalNewMsgId, false, message);
+#endif
+
     // The local user's own recalls must look native (just WeChat's "You recalled a
     // message" affordance). Restore/retain the real newmsgid so WeChat deletes it
     // normally, and leave the tip text untouched. Detect self-recalls from both the
@@ -1554,15 +1560,12 @@ bool hookedParseRevokeXML(void *message, std::string *xml, void *flag) {
             if (revokeNewMsgIdFromXML(xml, realNewMsgId)) {
                 *newMsgId = realNewMsgId;
             }
+#if defined(__x86_64__)
+            logIntelRevokeDecision("parse-self-native", *newMsgId, false, message);
+#endif
             return result;
         }
 
-#if defined(__x86_64__)
-        // Intel 269341 keeps newMsgId intact so OnMessageRevoke can locate the
-        // recalled item and build WeChat's own gray system-message row. The patched
-        // delete call consumes this flag and skips only the actual deletion.
-        suppressNextRevokeDelete.store(true, std::memory_order_release);
-#endif
         const char *phrase = [configuredPhrase() UTF8String];
         if (phrase != nullptr) {
 #if !defined(__x86_64__)
@@ -1582,41 +1585,6 @@ bool hookedParseRevokeXML(void *message, std::string *xml, void *flag) {
 
     return result;
 }
-
-#if defined(__x86_64__)
-void callOriginalRevokeDelete(void *message) {
-    if (message == nullptr || !isAddressRangeReadable(message, sizeof(void *))) {
-        return;
-    }
-
-    auto **vtable = *reinterpret_cast<void ***>(message);
-    constexpr size_t deleteMethodOffset = 0xe0;
-    if (vtable == nullptr ||
-        !isAddressRangeReadable(
-            reinterpret_cast<const uint8_t *>(vtable) + deleteMethodOffset,
-            sizeof(void *)
-        )) {
-        return;
-    }
-
-    RevokeDeleteMethod method = nullptr;
-    std::memcpy(
-        &method,
-        reinterpret_cast<const uint8_t *>(vtable) + deleteMethodOffset,
-        sizeof(method)
-    );
-    if (method != nullptr) {
-        method(message);
-    }
-}
-
-void hookedRevokeDelete(void *message) {
-    const bool suppress = suppressNextRevokeDelete.exchange(false, std::memory_order_acq_rel);
-    if (!suppress) {
-        callOriginalRevokeDelete(message);
-    }
-}
-#endif
 
 void hookedFinalizeMessage(void *message, int mode) {
     if (originalFinalizeMessage == nullptr) {
@@ -1804,20 +1772,6 @@ uint64_t decodeX86EntryStubSlot(const uint8_t entry[x86EntryStubLength], uint64_
     );
 }
 
-// x86_64: call qword ptr [rip+disp32]. This is deliberately decoded separately
-// from the entry jump so an unpatched vtable call can never be mistaken for a SLOT.
-uint64_t decodeX86IndirectCallSlot(const uint8_t entry[x86EntryStubLength], uint64_t callAddress) {
-    if (entry == nullptr || entry[0] != 0xff || entry[1] != 0x15) {
-        return 0;
-    }
-
-    int32_t displacement = 0;
-    std::memcpy(&displacement, entry + 2, sizeof(displacement));
-    return static_cast<uint64_t>(
-        static_cast<int64_t>(callAddress + x86EntryStubLength) + displacement
-    );
-}
-
 // Map an executable copy of `byteCount` bytes from `bytes`. Prefers RW->mprotect(RX)
 // (works for non-hardened processes), falling back to MAP_JIT. Returns nullptr on
 // failure. `allocSize` receives the rounded page size for later munmap.
@@ -1932,18 +1886,6 @@ const X86InlineMessageCaptureHookConfig *x86InlineMessageCaptureHookConfigForBui
         return nullptr;
     }
     for (const auto &config : x86InlineMessageCaptureHookConfigs) {
-        if (std::strcmp(config.buildVersion, buildVersion) == 0) {
-            return &config;
-        }
-    }
-    return nullptr;
-}
-
-const X86RevokeDeleteHookConfig *x86RevokeDeleteHookConfigForBuild(const char *buildVersion) {
-    if (buildVersion == nullptr) {
-        return nullptr;
-    }
-    for (const auto &config : x86RevokeDeleteHookConfigs) {
         if (std::strcmp(config.buildVersion, buildVersion) == 0) {
             return &config;
         }
@@ -2174,34 +2116,6 @@ void installX86MessageCaptureInlineHook(
     }
 }
 
-#if defined(__x86_64__)
-void installX86RevokeDeleteCallHook(
-    const WeChatDylibImage &image,
-    const X86RevokeDeleteHookConfig *config
-) {
-    const uintptr_t callAddress = image.slide + config->callOffset;
-    if (!rangeContains(image.start, image.size, callAddress, x86EntryStubLength) ||
-        !isAddressRangeReadable(reinterpret_cast<const void *>(callAddress), x86EntryStubLength)) {
-        return;
-    }
-
-    uint8_t callBytes[x86EntryStubLength];
-    std::memcpy(callBytes, reinterpret_cast<const void *>(callAddress), sizeof(callBytes));
-    const uint64_t slotAddress = decodeX86IndirectCallSlot(callBytes, callAddress);
-    if (slotAddress == 0 ||
-        !rangeContains(image.start, image.size, slotAddress, sizeof(void *)) ||
-        !isAddressRangeReadable(reinterpret_cast<const void *>(slotAddress), sizeof(void *))) {
-        return;
-    }
-
-    auto **slot = reinterpret_cast<void **>(slotAddress);
-    if (*slot == reinterpret_cast<void *>(&hookedRevokeDelete)) {
-        return;
-    }
-    writeHookSlot(slot, reinterpret_cast<void *>(&hookedRevokeDelete));
-}
-#endif
-
 void installRevokeTipHook() {
     WeChatDylibImage image = {};
     if (!findWeChatDylibImage(image)) {
@@ -2215,9 +2129,6 @@ void installRevokeTipHook() {
     }
     if (const auto *captureConfig = x86InlineMessageCaptureHookConfigForBuild(buildVersion.c_str())) {
         installX86MessageCaptureInlineHook(image, captureConfig);
-    }
-    if (const auto *deleteConfig = x86RevokeDeleteHookConfigForBuild(buildVersion.c_str())) {
-        installX86RevokeDeleteCallHook(image, deleteConfig);
     }
 #else
     if (const auto *config = revokeHookConfigForBuild(buildVersion.c_str())) {
@@ -2416,55 +2327,6 @@ int wechat_antirecall_encode_x86_64_entry_stub(uint64_t entryAddr, uint64_t slot
 
 uint64_t wechat_antirecall_decode_x86_64_entry_stub_slot(const uint8_t *entry, uint64_t entryAddr) {
     return decodeX86EntryStubSlot(entry, entryAddr);
-}
-
-uint64_t wechat_antirecall_decode_x86_64_indirect_call_slot(const uint8_t *entry, uint64_t callAddr) {
-    return decodeX86IndirectCallSlot(entry, callAddr);
-}
-
-namespace {
-#if defined(__x86_64__)
-int revokeDeleteSelftestCallCount = 0;
-void revokeDeleteSelftestOriginal(void *) {
-    revokeDeleteSelftestCallCount += 1;
-}
-void *revokeDeleteSelftestArmOnWorker(void *) {
-    suppressNextRevokeDelete.store(true, std::memory_order_release);
-    return nullptr;
-}
-#endif
-} // namespace
-
-int wechat_antirecall_x86_64_revoke_delete_interceptor_selftest(void) {
-#if defined(__x86_64__)
-    constexpr size_t deleteMethodIndex = 0xe0 / sizeof(void *);
-    void *vtable[deleteMethodIndex + 1] = {};
-    vtable[deleteMethodIndex] = reinterpret_cast<void *>(&revokeDeleteSelftestOriginal);
-    struct FakeMessage {
-        void **vtable;
-    } message = {vtable};
-
-    revokeDeleteSelftestCallCount = 0;
-    suppressNextRevokeDelete.store(false, std::memory_order_release);
-    pthread_t worker = {};
-    if (pthread_create(&worker, nullptr, &revokeDeleteSelftestArmOnWorker, nullptr) != 0) {
-        return 0;
-    }
-    pthread_join(worker, nullptr);
-    hookedRevokeDelete(&message);
-    if (revokeDeleteSelftestCallCount != 0) {
-        return 0;
-    }
-    hookedRevokeDelete(&message);
-    if (revokeDeleteSelftestCallCount != 1) {
-        return 0;
-    }
-    suppressNextRevokeDelete.store(false, std::memory_order_release);
-    hookedRevokeDelete(&message);
-    return revokeDeleteSelftestCallCount == 2 ? 1 : 0;
-#else
-    return 0;
-#endif
 }
 
 namespace {

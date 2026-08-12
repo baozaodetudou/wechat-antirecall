@@ -67,6 +67,8 @@
 - **静默（`revoke`）**：把入口处一条分支 `E00F0034`（`cbz`）改成 `7F000014`（无条件跳转 / `b`），跳过删除原消息的逻辑。
 - **提示（`revoke-tip`）**：入口保持 / 还原成 `E00F0034`，再把 `str x0,[x19,#0x168]`（`60B600F9`）改成 `str xzr,…`（`7FB600F9`），把 `newmsgid` 写零——微信因此保留原消息但仍显示撤回提示。
 
+Intel 269341 是例外：静默模式使用 `revoke` 分支补丁保留原消息；自定义提示模式必须保留真实 `newmsgid` 才能生成聊天流灰条，因此微信会用灰条替换原消息气泡。两种效果不能同时启用。
+
 因为改的是 dylib 而非主二进制，`resign()` 会**先单独重签被 patch 的 dylib，再重签整个 App**，避免运行到被改代码页时触发 `Code Signature Invalid`。
 
 ---
@@ -154,7 +156,7 @@ IDA Pro 9.4 对 269340/269341 arm64 切片的聚焦分析确认：撤回 XML 解
 
 - **269340**：微信 4.1.12 热修（`CFBundleVersion` 269340）。在 IDA Pro 9.4 中对 arm64 切片做聚焦分析：包装函数 `0x462dfec` 调用的核心函数 `0x462e200` 带有 `TryParseMessageXML` 日志字符串，调用点明确只传 `x0` 输出对象、`x1` 原始内容 `std::string *`、`x2` 标志指针三个参数；同时 vtable `0x9479db0` 的类型列表方法 `0x462df44` 返回 `71/72`，证明它是撤回相关类型扩展而非通用接收路径。269332+ 的补丁几何仍唯一命中：入口 `0x462e200`，`revoke` 守卫 `entry+0x270`=`0x462e470`（`40100034`→`82000014`），`newmsgid` 写入 `entry+0xA10`=`0x462ec10`（`60CE00F9`→`7FCE00F9`），输出字段仍为 `0x198`/`0x1A0`。通用 Message 终结器 `sub_45CE1A4` 的入口为 `0x45ce1a4`；网络构造函数 `sub_45CCE50` 先填入 server ID `+0xF8`、msgType `+0x0C`、content `+0x130`，再调用终结器，而终结器从 `+0x218` 取扩展对象并通过 vtable `+0x18` 分发，故在此处增加第二个 receive-cache hook。`__DATA` 结束仍为 `0x9aa0000`、`__common` 结束为 `0x9a9ea68`；撤回槽 `0x9a9ff00` 的入口桩为 `90A302B0108247F900021FD6`，相邻接收槽 `0x9a9ff08` 的入口桩为 `90A602B0108647F900021FD6`。屏蔽更新 8 处为 `0x26e4c0`、`0x2706ec`、`0x2709bc`、`0x270ddc`、`0x27b1d0`、`0x27b1d8`、`0x27b1e0`、`0x27b1e8`，原始字节与既有方法语义一致。真实 `/Applications/WeChat.app` 已通过 `install --dry-run` 的 silent / runtime-tip / block-update 三种模式逐点确认。
 - **269341**：当前微信 4.1.12 热修（`CFBundleVersion` 269341，arm64 切片 SHA-256 `76ff311df01419109d3a57f3fe356ed3dc18a8e6599b85c90e91072375cda625`，x86_64 切片 SHA-256 `1a7e7da9d88fb9b80e262f1849855cadcd310246a4f6301fe8b0d422adf33510`）。IDA Pro 9.4 批处理扫描与全片字节几何交叉核对后，269332+ 撤回解析器特征仍唯一命中：入口 `0x462e60c`，守卫 `entry+0x270`=`0x462e87c`，`newmsgid` 写入 `entry+0xA10`=`0x462f01c`；函数内 `str x0,[x19,#0x198]` 仍唯一，四处 `ldr x0,[x19,#0x1A0]` 继续确认字段布局。通用 Message 路径移动到构造函数 `sub_45CD25C` 与终结器 `sub_45CE5B0`：构造函数把来源 `+0x50` 写到 Message `+0xF8`，通过 `sub_45CDF24` 把类型写到 `+0x0C`，把内容复制到 `+0x130`，随后无条件 `bl 0x45ce5b0`；终结器的 `ldrb/cmp/ccmp` 前缀逐字节不变，并继续从 `+0x218` 经 vtable `+0x18` 分发。`__DATA`/`__common` 边界仍为 `0x9aa0000`/`0x9a9ea68`，所以两个 SLOT 与入口桩字节保持不变。8 个更新补丁点及其原始字节也与 269340 相同。真实二进制已通过 silent、runtime-tip、runtime-tip + block-update、update-only 四种 dry-run；临时 APFS 副本完成实际安装后，LLDB 确认两个入口桩分别写入 `90A302B0108247F900021FD6`/`90A602B0108647F900021FD6`，两个 SLOT 分别解析到 `hookedParseRevokeXML`/`hookedFinalizeMessage`。
-  - x86_64 支持仅限本构建：撤回解析入口 `0x4d34650` 以 `jmp [rip+disp32]` 指向 `0xa53ff00`，消息终结器 `0x4cc8b40` 指向相邻槽 `0xa53ff08`；两处跳板分别完整重放 6 字节函数序言和 7 字节 `movzx eax,[rdi+0x250]`。静默守卫为 `0x4d3493b`，`newmsgid +0x198` 写入为 `0x4d34ead`。更新拦截的 8 个 IMP 由本切片 `XAppUpdateManager` selector→IMP 表解析为 `0x2af4f0`、`0x2b1b80`、`0x2b1ea0`、`0x2b2300`、`0x2bd720`、`0x2bd730`、`0x2bd740`、`0x2bd750`。本机原始 App 已通过双架构 dry-run；临时副本完成实际安装与 ad-hoc 重签，`codesign --verify --deep --strict` 通过，第二次 dry-run 的 26 条补丁/注入报告全部为 already patched/injected。
+  - x86_64 支持仅限本构建：撤回解析入口 `0x4d34650` 以 `jmp [rip+disp32]` 指向 `0xa53ff00`，消息终结器 `0x4cc8b40` 指向相邻槽 `0xa53ff08`；两处跳板分别完整重放 6 字节函数序言和 7 字节 `movzx eax,[rdi+0x250]`。静默守卫为 `0x4d3493b`，`newmsgid +0x198` 写入为 `0x4d34ead`。实机验证表明：静默模式只保留原消息，自定义提示模式只显示聊天流灰条并替换原气泡；保持真实 ID 是灰条生成的必要条件。更新拦截的 8 个 IMP 由本切片 `XAppUpdateManager` selector→IMP 表解析为 `0x2af4f0`、`0x2b1b80`、`0x2b1ea0`、`0x2b2300`、`0x2bd720`、`0x2bd730`、`0x2bd740`、`0x2bd750`。本机原始 App 已通过双架构 dry-run；临时副本完成实际安装与 ad-hoc 重签，`codesign --verify --deep --strict` 通过。
 
 ---
 

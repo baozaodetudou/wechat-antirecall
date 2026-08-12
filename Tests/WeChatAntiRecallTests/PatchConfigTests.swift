@@ -419,9 +419,8 @@ final class PatchConfigTests: XCTestCase {
             ]
         )
 
-        // Intel keeps the real newmsgid so WeChat still builds its native gray revoke
-        // notice. The delete call itself is routed through a runtime slot so other-user
-        // recalls can be kept while self-recalls still invoke the original virtual method.
+        // Intel keeps WeChat's native gray-notice branch enabled. Unlike silent mode,
+        // WeChat replaces the recalled row with this customized in-chat notice.
         let revokeTip = try XCTUnwrap(config.targets.first { $0.identifier == "revoke-tip" })
         let intelRevokeTipEntries = revokeTip.entries.filter { $0.arch == .x86_64 }
         XCTAssertEqual(intelRevokeTipEntries.map(\.address), [0x4d3493b, 0x4d34ead])
@@ -435,13 +434,12 @@ final class PatchConfigTests: XCTestCase {
 
         let runtimeTip = try XCTUnwrap(config.targets.first { $0.identifier == "runtime-tip" })
         let intelEntries = runtimeTip.entries.filter { $0.arch == .x86_64 }
-        XCTAssertEqual(intelEntries.map(\.address), [0x4d34650, 0x4cc8b40, 0x960601])
+        XCTAssertEqual(intelEntries.map(\.address), [0x4d34650, 0x4cc8b40])
         XCTAssertEqual(
             intelEntries.map(\.patchBytes),
             [
                 try Data(hexString: "FF25AAB88005"),
                 try Data(hexString: "FF25C273870590"),
-                try Data(hexString: "FF1509F9BD09"),
             ]
         )
     }

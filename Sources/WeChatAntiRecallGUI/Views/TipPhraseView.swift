@@ -132,6 +132,11 @@ struct TipPhraseView: View {
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
 
+                HintRow(
+                    systemImage: "info.circle",
+                    text: "Intel 微信中，自定义灰色提示会替换原消息气泡；需要保留原消息时请选择「静默防撤回」。",
+                    tint: .orange)
+
                 if state.wechatRunning && !customTipInstalled {
                     HStack {
                         HintRow(systemImage: "exclamationmark.circle.fill", text: "首次安装前请先完全退出微信。", tint: .orange)

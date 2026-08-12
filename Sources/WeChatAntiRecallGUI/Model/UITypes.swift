@@ -23,7 +23,7 @@ enum InstallMode: String, CaseIterable, Identifiable {
     var subtitle: String {
         switch self {
         case .silent: return "别人撤回的消息原样留下，不显示任何提示"
-        case .customTip: return "把别人撤回的提示换成你的自定义短语（需该版本支持）"
+        case .customTip: return "在聊天流显示自定义灰色提示；Intel 版不会保留原消息气泡"
         case .updateOnly: return "只拦截微信自动升级，不改动防撤回"
         }
     }
