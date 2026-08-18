@@ -105,7 +105,7 @@ struct HomeView: View {
                     }
                 }
 
-                if state.installedMode == .customTip {
+                if state.installedMode?.usesCustomTipRuntime == true {
                     Button(action: goToCustomTip) {
                         Label("修改自定义提示", systemImage: "text.bubble")
                             .frame(maxWidth: .infinity)
@@ -129,7 +129,7 @@ struct HomeView: View {
                 }
 
                 HStack(spacing: 12) {
-                    if state.installedMode != .customTip && state.runtimeTipSupported {
+                    if state.installedMode?.usesCustomTipRuntime != true && state.runtimeTipSupported {
                         Button("使用自定义提示") { goToCustomTip() }
                             .buttonStyle(.link)
                     }
@@ -138,7 +138,7 @@ struct HomeView: View {
                 }
 
                 HintRow(systemImage: "info.circle",
-                        text: state.installedMode == .customTip
+                        text: state.installedMode?.usesCustomTipRuntime == true
                             ? "自定义提示运行时已安装；修改短语后完全退出并重开微信即可生效。"
                             : "安装会修改并重新签名微信。装完请完全退出并重开微信。")
             }
@@ -152,7 +152,7 @@ struct HomeView: View {
     private var installStatePill: some View {
         switch state.installState {
         case .installed:
-            let text = state.installedMode == .customTip ? "自定义提示已开启" : "静默模式已开启"
+            let text = state.installedMode?.usesCustomTipRuntime == true ? "自定义提示已开启" : "静默模式已开启"
             return AnyView(StatusPill(tone: .good, text: text, systemImage: "checkmark.circle.fill"))
         case .notInstalled: return AnyView(StatusPill(tone: .neutral, text: "未开启"))
         case .mismatch: return AnyView(StatusPill(tone: .warn, text: "数据不匹配"))

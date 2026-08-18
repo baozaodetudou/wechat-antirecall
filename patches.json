@@ -1527,6 +1527,14 @@
           { "arch": "x86_64", "addr": "4d34650", "expected": "554889E54157", "asm": "FF25AAB88005" },
           { "arch": "x86_64", "addr": "4cc8b40", "expected": "0FB68750020000", "asm": "FF25C273870590" }
         ]
+      },
+      {
+        "identifier": "runtime-preserve-tip",
+        "binary": "Contents/Resources/wechat.dylib",
+        "entries": [
+          { "arch": "x86_64", "addr": "3432dd0", "expected": "554889E54157", "asm": "FF2542D11007" },
+          { "arch": "x86_64", "addr": "34334d0", "expected": "554889E54157", "asm": "FF253ACA1007" }
+        ]
       }
     ]
   }

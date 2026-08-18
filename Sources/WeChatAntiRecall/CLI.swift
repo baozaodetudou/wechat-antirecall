@@ -829,6 +829,13 @@ struct CLI {
             selected.append(("runtime-tip", runtimeTipTarget))
         }
 
+        if options.preserveWithTip {
+            guard let preserveTipTarget = config.targets.first(where: { $0.identifier == "runtime-preserve-tip" }) else {
+                throw ToolError.invalidConfig("构建号 \(config.version) 不支持保留原消息并显示提示")
+            }
+            selected.append(("runtime-preserve-tip", preserveTipTarget))
+        }
+
         return selected
     }
 
@@ -862,7 +869,7 @@ struct CLI {
 
         Usage:
           wechat-antirecall versions [--app /Applications/WeChat.app] [--config patches.json] [--json]
-          wechat-antirecall install  [--app /Applications/WeChat.app] [--config patches.json] [--with-tip (deprecated, prefer --runtime-tip)] [--runtime-tip] [--runtime-dylib <path>] [--multi-instance] [--block-update] [--update-only] [--dry-run] [--no-backup] [--skip-resign] [--json]
+          wechat-antirecall install  [--app /Applications/WeChat.app] [--config patches.json] [--with-tip (deprecated, prefer --runtime-tip)] [--runtime-tip | --preserve-with-tip] [--runtime-dylib <path>] [--multi-instance] [--block-update] [--update-only] [--dry-run] [--no-backup] [--skip-resign] [--json]
           wechat-antirecall clone    [--app /Applications/WeChat.app] [--output-dir /Applications] [--count 2] [--name-prefix WeChat] [--keep-url-schemes] [--replace] [--dry-run] [--skip-resign] [--json]
           wechat-antirecall restore  --backup <path> [--binary Contents/MacOS/WeChat] [--app /Applications/WeChat.app] [--skip-resign]
           wechat-antirecall tip-phrase get
@@ -878,6 +885,9 @@ struct CLI {
           is a pure byte patch with no runtime hook, so it cannot handle your own recalls
           (they leave a duplicate tip line); --runtime-tip addresses this via its hook.
           --with-tip still works as a fallback.
+          --preserve-with-tip is currently only available for Intel
+          WeChat 4.1.12 build 269341. It keeps the original row and asks WeChat to add
+          an independent gray recall notice.
           --json emits machine-readable output (used by the GUI); on error it prints a JSON
           envelope to stdout and still exits non-zero.
         """)
@@ -934,6 +944,7 @@ struct InstallOptions {
     var noBackup = false
     var skipResign = false
     var runtimeTip = false
+    var preserveWithTip = false
     var runtimeDylibPath: String?
     var json = false
 
@@ -945,6 +956,9 @@ struct InstallOptions {
         var identifiers = [withTip ? "revoke-tip" : "revoke"]
         if runtimeTip {
             identifiers.append("runtime-tip")
+        }
+        if preserveWithTip {
+            identifiers.append("runtime-preserve-tip")
         }
         if multiInstance {
             identifiers.append("multiInstance")
@@ -967,6 +981,10 @@ struct InstallOptions {
                 withTip = true
                 explicitWithTip = true
             case "--runtime-tip":
+                runtimeTip = true
+                withTip = true
+            case "--preserve-with-tip":
+                preserveWithTip = true
                 runtimeTip = true
                 withTip = true
             case "--runtime-dylib":
@@ -993,8 +1011,18 @@ struct InstallOptions {
             }
         }
 
+        if preserveWithTip {
+            // The combined mode needs WeChat's native notice-producing branch. The
+            // runtime hook protects the original row at the destructive apply step.
+            // Keep this order-independent when flags are supplied in either order.
+            withTip = true
+        }
+
         if updateOnly && runtimeTip {
             throw ToolError.usage("--update-only 不能与 --runtime-tip 同时使用")
+        }
+        if preserveWithTip && explicitWithTip {
+            throw ToolError.usage("--preserve-with-tip 不能与 --with-tip 同时使用")
         }
         if updateOnly && multiInstance {
             throw ToolError.usage("--update-only 不能与 --multi-instance 同时使用")
@@ -1033,6 +1061,8 @@ private func displayName(forTargetIdentifier identifier: String) -> String {
         return "block automatic update"
     case "runtime-tip":
         return "route revoke parser through runtime hook (inline)"
+    case "runtime-preserve-tip":
+        return "preserve recalled row and emit independent notice"
     case "multiInstance":
         return "enable multi-instance"
     case "multiInstance-extra":

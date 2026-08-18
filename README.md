@@ -18,7 +18,7 @@
 | 你想要的效果 | 对应功能 |
 | --- | --- |
 | 别人撤回后，消息仍留在聊天里 | **静默防撤回** |
-| 显示“谁在什么时候撤回了什么” | **自定义提示** |
+| 显示“谁在什么时候撤回了什么” | **自定义提示**；Intel 4.1.12 可同时保留原消息 |
 | 避免微信自动升级后覆盖补丁 | **屏蔽自动更新** |
 | 同时登录多个微信账号 | **微信多开** |
 | 回到修改前的原版微信 | **恢复 / 卸载** |
@@ -103,7 +103,7 @@
 4. 以后修改短语只需点击「保存并应用」，不会重复签名微信。
 5. 完全退出并重新打开微信。
 
-> Intel 微信 4.1.12（269341）使用微信聊天流内的灰色系统提示。受微信内部处理方式限制，原消息气泡会被这条灰色提示替换；如果需要保留原消息，请选择「静默防撤回」。
+> Intel 微信 4.1.12（269341）会同时保留原消息气泡，并在微信聊天流内显示自定义灰色系统提示。图形界面会自动选择这个组合模式。
 
 > 如果页面提示无权读取已保存的短语，按页面按钮为本 App 开启「完全磁盘访问」，然后退出并重新打开本 App。
 
@@ -337,6 +337,14 @@ sudo .build/release/wechat-antirecall install --app /Applications/WeChat.app
 sudo .build/release/wechat-antirecall install \
   --runtime-tip \
   --block-update \
+  --app /Applications/WeChat.app
+```
+
+Intel 微信 4.1.12（构建号 269341）需要同时保留原消息和灰色提示时，使用：
+
+```bash
+sudo .build/release/wechat-antirecall install \
+  --preserve-with-tip \
   --app /Applications/WeChat.app
 ```
 

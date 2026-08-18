@@ -14,8 +14,18 @@ struct AdvancedInstallView: View {
 
     private var features: VersionsReport.Features? { state.versions?.features }
     private var supported: Bool { if case .supported = state.supportStatus { return true } else { return false } }
-    private var modeAvailable: Bool { mode != .customTip || state.runtimeTipSupported }
-    private var requiresRestore: Bool { state.installedMode == .customTip && mode == .silent }
+    private var modeAvailable: Bool {
+        switch mode {
+        case .customTip: return state.runtimeTipSupported
+        case .preserveWithTip: return state.preserveWithTipSupported
+        default: return true
+        }
+    }
+    private var requiresRestore: Bool {
+        let leavesCombinedMode = state.installedMode == .preserveWithTip && mode != .preserveWithTip && mode != .updateOnly
+        let leavesCustomRuntime = state.installedMode?.usesCustomTipRuntime == true && mode == .silent
+        return leavesCombinedMode || leavesCustomRuntime
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: Theme.gap) {
@@ -44,7 +54,8 @@ struct AdvancedInstallView: View {
             VStack(alignment: .leading, spacing: 12) {
                 SectionLabel(text: "模式")
                 ForEach(InstallMode.allCases) { m in
-                    let disabled = (m == .customTip && !state.runtimeTipSupported)
+                    let disabled = (m == .customTip && !state.runtimeTipSupported) ||
+                        (m == .preserveWithTip && !state.preserveWithTipSupported)
                     Button {
                         if !disabled { mode = m }
                     } label: {
@@ -58,7 +69,7 @@ struct AdvancedInstallView: View {
                                         StatusPill(tone: .good, text: "当前模式", systemImage: "checkmark.circle.fill")
                                     }
                                 }
-                                Text(disabled ? "当前版本不支持自定义提示（需要新的应用更新，不是拉数据能解决）" : m.subtitle)
+                                Text(disabled ? unavailableText(for: m) : m.subtitle)
                                     .font(.caption).foregroundStyle(.secondary)
                                     .fixedSize(horizontal: false, vertical: true)
                             }
@@ -68,7 +79,7 @@ struct AdvancedInstallView: View {
                     .buttonStyle(.plain)
                     .disabled(disabled)
                 }
-                if mode == .customTip {
+                if mode.usesCustomTipRuntime {
                     HintRow(systemImage: "text.bubble",
                             text: "自定义短语可在「自定义提示」页直接保存并安装；这里用于组合更多高级选项。")
                 }
@@ -110,7 +121,7 @@ struct AdvancedInstallView: View {
                     HStack(alignment: .top) {
                         HintRow(
                             systemImage: "arrow.uturn.backward.circle.fill",
-                            text: "从「自定义提示」切回「静默防撤回」前，需先还原备份，避免留下运行时 hook。",
+                            text: "切换到该模式前需先还原备份，避免留下上一种模式的运行时 hook。",
                             tint: .orange)
                         Button("前往恢复") { goToRestore() }
                             .buttonStyle(.bordered)
@@ -146,4 +157,11 @@ struct AdvancedInstallView: View {
 
     private var canBlockUpdate: Bool { features?.blockUpdate ?? false }
     private var canMultiInstance: Bool { features?.multiInstance ?? false }
+
+    private func unavailableText(for mode: InstallMode) -> String {
+        if mode == .preserveWithTip {
+            return "该组合模式目前仅支持 Intel 微信 4.1.12（构建号 269341）"
+        }
+        return "当前版本不支持自定义提示（需要新的应用更新，不是拉数据能解决）"
+    }
 }

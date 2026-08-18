@@ -9,6 +9,7 @@ struct GUIError: LocalizedError {
 enum InstallMode: String, CaseIterable, Identifiable {
     case silent
     case customTip
+    case preserveWithTip
     case updateOnly
     var id: String { rawValue }
 
@@ -16,6 +17,7 @@ enum InstallMode: String, CaseIterable, Identifiable {
         switch self {
         case .silent: return "静默防撤回"
         case .customTip: return "自定义撤回提示"
+        case .preserveWithTip: return "保留原消息 + 自定义提示"
         case .updateOnly: return "仅屏蔽自动更新"
         }
     }
@@ -24,8 +26,13 @@ enum InstallMode: String, CaseIterable, Identifiable {
         switch self {
         case .silent: return "别人撤回的消息原样留下，不显示任何提示"
         case .customTip: return "在聊天流显示自定义灰色提示；Intel 版不会保留原消息气泡"
+        case .preserveWithTip: return "Intel 微信 4.1.12：原消息气泡继续保留，同时显示自定义灰色提示"
         case .updateOnly: return "只拦截微信自动升级，不改动防撤回"
         }
+    }
+
+    var usesCustomTipRuntime: Bool {
+        self == .customTip || self == .preserveWithTip
     }
 }
 
@@ -43,6 +50,8 @@ struct InstallRequest {
             break
         case .customTip:
             args += ["--runtime-tip", "--runtime-dylib", runtimeDylibURL.path]
+        case .preserveWithTip:
+            args += ["--preserve-with-tip", "--runtime-dylib", runtimeDylibURL.path]
         case .updateOnly:
             args += ["--update-only"]
         }

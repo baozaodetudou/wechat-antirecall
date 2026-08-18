@@ -56,6 +56,25 @@ final class InstallOptionsTests: XCTestCase {
         XCTAssertFalse(options.runtimeTip)
     }
 
+    func testPreserveWithTipUsesNativeNoticeBranchAndAddsRowProtectionHook() throws {
+        let options = try InstallOptions([
+            "--preserve-with-tip",
+            "--runtime-dylib", "/tmp/x.dylib",
+        ])
+
+        XCTAssertTrue(options.preserveWithTip)
+        XCTAssertTrue(options.runtimeTip)
+        XCTAssertTrue(options.withTip, "combined mode needs WeChat's native notice-producing branch")
+        XCTAssertEqual(
+            options.targetIdentifiers,
+            ["revoke-tip", "runtime-tip", "runtime-preserve-tip"]
+        )
+    }
+
+    func testPreserveWithTipIsRejectedWithStandaloneWithTip() throws {
+        XCTAssertThrowsError(try InstallOptions(["--preserve-with-tip", "--with-tip"]))
+    }
+
     func testDeprecationNoticeRecommendsRuntimeTipOnSupportedBuild() {
         let notice = withTipDeprecationNotice(buildVersion: "268850", runtimeTipSupported: true)
         XCTAssertTrue(notice.contains("已弃用"))

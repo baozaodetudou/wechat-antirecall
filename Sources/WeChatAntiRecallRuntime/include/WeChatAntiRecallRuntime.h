@@ -104,6 +104,12 @@ int wechat_antirecall_x86_64_inline_hook_selftest(void);
 // End-to-end x86_64 test using the exact 269341 Message-finalizer displaced load.
 int wechat_antirecall_x86_64_message_capture_inline_hook_selftest(void);
 
+// Reproduces the production order for Intel combined mode: the revoke parser arms
+// row protection, the common Message finalizer returns, and only then the destructive
+// apply function runs. Returns 1 iff the finalizer preserves the pending flag, the
+// recalled-row write is bypassed, and a later unrelated write reaches the original.
+int wechat_antirecall_x86_64_preserve_and_notice_sequence_selftest(void);
+
 #ifdef __cplusplus
 }
 #endif

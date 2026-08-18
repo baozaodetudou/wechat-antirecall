@@ -21,12 +21,44 @@ final class InlineHookEngineTests: XCTestCase {
         )
     }
 
+    func testX8664IndependentNoticeEntryStubMatchesBuild269341Catalog() throws {
+        var protectBytes = [UInt8](repeating: 0, count: 6)
+        XCTAssertEqual(
+            wechat_antirecall_encode_x86_64_entry_stub(0x3432dd0, 0xa53ff18, &protectBytes),
+            1
+        )
+        XCTAssertEqual(protectBytes.map { String(format: "%02X", $0) }.joined(), "FF2542D11007")
+        XCTAssertEqual(
+            wechat_antirecall_decode_x86_64_entry_stub_slot(&protectBytes, 0x3432dd0),
+            0xa53ff18
+        )
+
+        var availabilityBytes = [UInt8](repeating: 0, count: 6)
+        XCTAssertEqual(
+            wechat_antirecall_encode_x86_64_entry_stub(0x34334d0, 0xa53ff10, &availabilityBytes),
+            1
+        )
+        XCTAssertEqual(availabilityBytes.map { String(format: "%02X", $0) }.joined(), "FF253ACA1007")
+        XCTAssertEqual(
+            wechat_antirecall_decode_x86_64_entry_stub_slot(&availabilityBytes, 0x34334d0),
+            0xa53ff10
+        )
+    }
+
     func testX8664InlineHookDispatchesThroughHookAndOriginal() {
         XCTAssertEqual(wechat_antirecall_x86_64_inline_hook_selftest(), 1)
     }
 
     func testX8664MessageCaptureTrampolinePreservesDisplacedLoad() {
         XCTAssertEqual(wechat_antirecall_x86_64_message_capture_inline_hook_selftest(), 1)
+    }
+
+    func testX8664CombinedModePreservesPendingStateUntilApplyConsumesIt() {
+        XCTAssertEqual(
+            wechat_antirecall_x86_64_preserve_and_notice_sequence_selftest(),
+            1,
+            "remote recall must skip only the recalled-row state write and keep the native availability path"
+        )
     }
 #endif
 

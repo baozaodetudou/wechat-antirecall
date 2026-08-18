@@ -117,16 +117,18 @@ struct TipPhraseView: View {
         Card {
             VStack(alignment: .leading, spacing: 12) {
                 HStack {
-                    SectionLabel(text: customTipInstalled ? "应用修改" : "保存并开启")
+                    SectionLabel(text: desiredModeInstalled ? "应用修改" : "保存并开启")
                     Spacer()
                     StatusPill(
-                        tone: customTipInstalled ? .good : .neutral,
-                        text: customTipInstalled ? "已安装" : "未安装",
-                        systemImage: customTipInstalled ? "checkmark.circle.fill" : "circle")
+                        tone: desiredModeInstalled ? .good : .neutral,
+                        text: desiredModeInstalled ? "已安装" : "待安装",
+                        systemImage: desiredModeInstalled ? "checkmark.circle.fill" : "circle")
                 }
 
-                Text(customTipInstalled
+                Text(desiredModeInstalled
                      ? "当前已是自定义提示模式。保存新短语后，只需重启微信，不会重复修改或签名 App。"
+                     : customTipInstalled && desiredMode == .preserveWithTip
+                     ? "当前是旧的提示模式；升级后会保留原消息气泡，并同时显示灰色提示。"
                      : "会先校验并保存短语，再检查补丁点、安装自定义提示运行时并重新签名微信。")
                     .font(.callout)
                     .foregroundStyle(.secondary)
@@ -134,10 +136,12 @@ struct TipPhraseView: View {
 
                 HintRow(
                     systemImage: "info.circle",
-                    text: "Intel 微信中，自定义灰色提示会替换原消息气泡；需要保留原消息时请选择「静默防撤回」。",
-                    tint: .orange)
+                    text: state.preserveWithTipSupported
+                        ? "Intel 微信 4.1.12 会保留原消息气泡，并在聊天流中同时显示这条灰色提示。"
+                        : "当前版本会在聊天流中显示自定义灰色提示。",
+                    tint: state.preserveWithTipSupported ? Theme.accent : .orange)
 
-                if state.wechatRunning && !customTipInstalled {
+                if state.wechatRunning && !desiredModeInstalled {
                     HStack {
                         HintRow(systemImage: "exclamationmark.circle.fill", text: "首次安装前请先完全退出微信。", tint: .orange)
                         Button("退出微信") { Task { await state.quitWeChat() } }
@@ -148,14 +152,14 @@ struct TipPhraseView: View {
                 Button {
                     Task { await saveAndApply() }
                 } label: {
-                    Text(customTipInstalled ? "保存并应用" : "保存并开启自定义提示")
+                    Text(installButtonTitle)
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 4)
                 }
                 .buttonStyle(.borderedProminent)
                 .controlSize(.large)
                 .tint(Theme.accent)
-                .disabled(controller.busy || state.busy || !state.runtimeTipSupported || (state.wechatRunning && !customTipInstalled))
+                .disabled(controller.busy || state.busy || !state.runtimeTipSupported || (state.wechatRunning && !desiredModeInstalled))
             }
         }
     }
@@ -205,18 +209,32 @@ struct TipPhraseView: View {
     }
 
     private var customTipInstalled: Bool {
-        state.installState == .installed && state.installedMode == .customTip
+        state.installState == .installed && state.installedMode?.usesCustomTipRuntime == true
+    }
+
+    private var desiredMode: InstallMode {
+        state.preserveWithTipSupported ? .preserveWithTip : .customTip
+    }
+
+    private var desiredModeInstalled: Bool {
+        state.installState == .installed && state.installedMode == desiredMode
+    }
+
+    private var installButtonTitle: String {
+        if desiredModeInstalled { return "保存并应用" }
+        if customTipInstalled && desiredMode == .preserveWithTip { return "升级为保留原消息 + 提示" }
+        return "保存并开启自定义提示"
     }
 
     private func saveAndApply() async {
         guard await controller.save() else { return }
-        if customTipInstalled {
+        if desiredModeInstalled {
             state.banner = Banner(
                 kind: .success,
                 title: "自定义提示已保存",
                 message: "请完全退出并重开微信，新短语即可生效。")
         } else {
-            await state.install(InstallRequest(mode: .customTip))
+            await state.install(InstallRequest(mode: desiredMode))
         }
     }
 }

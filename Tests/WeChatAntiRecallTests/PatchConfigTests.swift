@@ -364,7 +364,7 @@ final class PatchConfigTests: XCTestCase {
         let configs = try loadPatchConfigs()
         let config = try XCTUnwrap(configs.first { $0.version == "269341" })
 
-        XCTAssertEqual(config.targets.map(\.identifier), ["revoke", "revoke-tip", "update", "runtime-tip"])
+        XCTAssertEqual(config.targets.map(\.identifier), ["revoke", "revoke-tip", "update", "runtime-tip", "runtime-preserve-tip"])
         XCTAssertEqual(config.targets.first { $0.identifier == "revoke" }?.entries.first?.address, 0x462e87c)
         XCTAssertEqual(
             config.targets.first { $0.identifier == "revoke-tip" }?.entries
@@ -389,13 +389,26 @@ final class PatchConfigTests: XCTestCase {
         XCTAssertEqual(runtimeTip.entries[1].expectedBytes, [try Data(hexString: "084049391F0500712008407A")])
         XCTAssertEqual(runtimeTip.entries[1].patchBytes, try Data(hexString: "90A602B0108647F900021FD6"))
         XCTAssertTrue(RuntimeTipInstaller.supportedBuildVersions.contains("269341"))
+
+        let preserveTip = try XCTUnwrap(config.targets.first { $0.identifier == "runtime-preserve-tip" })
+        XCTAssertEqual(preserveTip.entries.count, 2)
+        XCTAssertTrue(preserveTip.entries.allSatisfy { $0.arch == .x86_64 })
+        XCTAssertEqual(preserveTip.entries.map(\.address), [0x3432dd0, 0x34334d0])
+        XCTAssertEqual(
+            preserveTip.entries.map(\.expectedBytes),
+            [[try Data(hexString: "554889E54157")], [try Data(hexString: "554889E54157")]]
+        )
+        XCTAssertEqual(
+            preserveTip.entries.map(\.patchBytes),
+            [try Data(hexString: "FF2542D11007"), try Data(hexString: "FF253ACA1007")]
+        )
     }
 
     func testBuild269341IncludesVerifiedIntelPatchEntries() throws {
         let configs = try loadPatchConfigs()
         let config = try XCTUnwrap(configs.first { $0.version == "269341" })
 
-        for identifier in ["revoke", "revoke-tip", "update", "runtime-tip"] {
+        for identifier in ["revoke", "revoke-tip", "update", "runtime-tip", "runtime-preserve-tip"] {
             let target = try XCTUnwrap(config.targets.first { $0.identifier == identifier })
             XCTAssertTrue(
                 target.entries.contains { $0.arch == .x86_64 },

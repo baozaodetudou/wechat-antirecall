@@ -35,6 +35,8 @@ constexpr size_t arm64StubLength = 16;
 // copied it into handlerOutput+0x1A0.
 using ParseRevokeXML = bool (*)(void *, std::string *, void *);
 using FinalizeMessage = void (*)(void *, int);
+using ApplyRevokeMessage = bool (*)(void *, std::string *);
+using ApplyRecalledRowState = void (*)(void *, void *, bool);
 
 struct RevokeHookConfig {
     const char *buildVersion;
@@ -103,6 +105,26 @@ struct X86InlineMessageCaptureHookConfig {
     ptrdiff_t serverIdOffset;
     ptrdiff_t msgTypeOffset;
     ptrdiff_t contentOffset;
+};
+
+// Intel 269341 combined mode keeps WeChat's native notice-producing branch, then
+// bypasses only the recalled-row state write for the current remote-recall event.
+// The later native availability path still runs, letting WeChat render the incoming
+// system Message as an independent gray notice while the original row stays intact.
+struct X86IndependentNoticeHookConfig {
+    const char *buildVersion;
+    uintptr_t entryOffset;
+    uint8_t savedBytes[x86SavedBytesMaximumCount];
+    size_t savedByteCount;
+    uintptr_t continuationOffset;
+};
+
+struct X86RecalledRowStateHookConfig {
+    const char *buildVersion;
+    uintptr_t entryOffset;
+    uint8_t savedBytes[x86SavedBytesMaximumCount];
+    size_t savedByteCount;
+    uintptr_t continuationOffset;
 };
 
 constexpr InlineRevokeHookConfig inlineRevokeHookConfigs[] = {
@@ -258,8 +280,30 @@ constexpr X86InlineMessageCaptureHookConfig x86InlineMessageCaptureHookConfigs[]
     },
 };
 
+constexpr X86IndependentNoticeHookConfig x86IndependentNoticeHookConfigs[] = {
+    {
+        "269341",
+        0x34334d0,
+        {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57}, // push rbp; mov rbp,rsp; push r15
+        6,
+        0x34334d6,
+    },
+};
+
+constexpr X86RecalledRowStateHookConfig x86RecalledRowStateHookConfigs[] = {
+    {
+        "269341",
+        0x3432dd0,
+        {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57}, // push rbp; mov rbp,rsp; push r15
+        6,
+        0x3432dd6,
+    },
+};
+
 ParseRevokeXML originalParseRevokeXML = nullptr;
 FinalizeMessage originalFinalizeMessage = nullptr;
+ApplyRevokeMessage originalApplyRevokeMessage = nullptr;
+ApplyRecalledRowState originalApplyRecalledRowState = nullptr;
 const RevokeHookConfig *activeRevokeHookConfig = nullptr;
 const InlineMessageCaptureHookConfig *activeMessageCaptureHookConfig = nullptr;
 // Backing storage for the offsets used by hookedParseRevokeXML when the active hook
@@ -281,6 +325,27 @@ std::unordered_map<std::string, std::string> revokeTimeCache;
 // {content}. Keyed by "id:<newmsgid>", the same scheme revokeTimeCacheKey uses.
 std::mutex revokeContentCacheMutex;
 std::unordered_map<std::string, std::string> revokeContentCache;
+
+#if defined(__x86_64__)
+bool independentNoticeModeActive = false;
+thread_local bool pendingIndependentRevokeNotice = false;
+int independentNoticeSequenceFinalizeCalls = 0;
+int independentNoticeSequenceApplyCalls = 0;
+int independentNoticeSequenceRowStateCalls = 0;
+
+void independentNoticeSequenceFinalizeStub(void *, int) {
+    independentNoticeSequenceFinalizeCalls += 1;
+}
+
+bool independentNoticeSequenceApplyStub(void *, std::string *) {
+    independentNoticeSequenceApplyCalls += 1;
+    return true;
+}
+
+void independentNoticeSequenceRowStateStub(void *, void *, bool) {
+    independentNoticeSequenceRowStateCalls += 1;
+}
+#endif
 
 std::string trimCopy(const std::string &value) {
     const char *whitespace = " \t\r\n\"'";
@@ -1515,6 +1580,15 @@ bool hookedParseRevokeXML(void *message, std::string *xml, void *flag) {
     }
 
     const bool result = originalParseRevokeXML(message, xml, flag);
+#if defined(__x86_64__)
+    if (independentNoticeModeActive && debugProbeEnabled()) {
+        os_log(OS_LOG_DEFAULT,
+               "[WeChatAntiRecallCombined] parser returned=%{public}s message=%p xml=%p",
+               result ? "true" : "false",
+               message,
+               xml);
+    }
+#endif
     if (!result || message == nullptr || xml == nullptr) {
         return result;
     }
@@ -1556,6 +1630,9 @@ bool hookedParseRevokeXML(void *message, std::string *xml, void *flag) {
         }
 
         if (selfRecall) {
+#if defined(__x86_64__)
+            pendingIndependentRevokeNotice = false;
+#endif
             uint64_t realNewMsgId = 0;
             if (revokeNewMsgIdFromXML(xml, realNewMsgId)) {
                 *newMsgId = realNewMsgId;
@@ -1570,6 +1647,19 @@ bool hookedParseRevokeXML(void *message, std::string *xml, void *flag) {
         if (phrase != nullptr) {
 #if !defined(__x86_64__)
             *newMsgId = 0;
+#else
+            if (independentNoticeModeActive) {
+                // Keep the real id so WeChat's native notice-producing path has all
+                // of its normal context. A narrower hook skips only the function that
+                // writes the recalled state onto the original row.
+                pendingIndependentRevokeNotice = true;
+                if (debugProbeEnabled()) {
+                    os_log(OS_LOG_DEFAULT,
+                           "[WeChatAntiRecallCombined] parser armed row protection original=%llu message=%p",
+                           originalNewMsgId,
+                           message);
+                }
+            }
 #endif
             const auto timeText = stableRevokeTimeText(originalNewMsgId, xml, originalReplaceMsg, currentTimeText());
             // Use the real newmsgid carried by the XML to join against the content
@@ -1598,6 +1688,52 @@ void hookedFinalizeMessage(void *message, int mode) {
 
     originalFinalizeMessage(message, mode);
 }
+
+#if defined(__x86_64__)
+void hookedApplyRecalledRowState(void *service, void *messageReference, bool alternateKey) {
+    if (independentNoticeModeActive && pendingIndependentRevokeNotice) {
+        if (debugProbeEnabled()) {
+            os_log(OS_LOG_DEFAULT,
+                   "[WeChatAntiRecallCombined] recalled-row state write skipped service=%p ref=%p alternate=%{public}s",
+                   service,
+                   messageReference,
+                   alternateKey ? "true" : "false");
+        }
+        logIntelRevokeDecision("recalled-row-state-skipped", 0, true, service);
+        return;
+    }
+
+    if (originalApplyRecalledRowState != nullptr) {
+        originalApplyRecalledRowState(service, messageReference, alternateKey);
+    }
+}
+
+bool hookedApplyRevokeMessage(void *service, std::string *lookupKey) {
+    if (independentNoticeModeActive && debugProbeEnabled()) {
+        os_log(OS_LOG_DEFAULT,
+               "[WeChatAntiRecallCombined] apply entered pending=%{public}s service=%p key=%p",
+               pendingIndependentRevokeNotice ? "true" : "false",
+               service,
+               lookupKey);
+    }
+    const bool consumePending = independentNoticeModeActive && pendingIndependentRevokeNotice;
+    const bool result = originalApplyRevokeMessage == nullptr
+        ? false
+        : originalApplyRevokeMessage(service, lookupKey);
+    if (consumePending) {
+        pendingIndependentRevokeNotice = false;
+        if (debugProbeEnabled()) {
+            os_log(OS_LOG_DEFAULT,
+                   "[WeChatAntiRecallCombined] native availability completed result=%{public}s service=%p key=%p",
+                   result ? "true" : "false",
+                   service,
+                   lookupKey);
+        }
+        logIntelRevokeDecision("native-notice-path-completed", 0, false, service);
+    }
+    return result;
+}
+#endif
 
 struct WeChatDylibImage {
     uintptr_t slide;
@@ -1893,6 +2029,30 @@ const X86InlineMessageCaptureHookConfig *x86InlineMessageCaptureHookConfigForBui
     return nullptr;
 }
 
+const X86IndependentNoticeHookConfig *x86IndependentNoticeHookConfigForBuild(const char *buildVersion) {
+    if (buildVersion == nullptr) {
+        return nullptr;
+    }
+    for (const auto &config : x86IndependentNoticeHookConfigs) {
+        if (std::strcmp(config.buildVersion, buildVersion) == 0) {
+            return &config;
+        }
+    }
+    return nullptr;
+}
+
+const X86RecalledRowStateHookConfig *x86RecalledRowStateHookConfigForBuild(const char *buildVersion) {
+    if (buildVersion == nullptr) {
+        return nullptr;
+    }
+    for (const auto &config : x86RecalledRowStateHookConfigs) {
+        if (std::strcmp(config.buildVersion, buildVersion) == 0) {
+            return &config;
+        }
+    }
+    return nullptr;
+}
+
 void installRevokeTipStubHook(const WeChatDylibImage &image, const RevokeHookConfig *config) {
     const uintptr_t originalBodyAddress = image.slide + config->originalBody;
     const uintptr_t hookSlotAddress = resolveParseRevokeXMLHookSlot(originalBodyAddress, image.start, image.size);
@@ -2116,9 +2276,111 @@ void installX86MessageCaptureInlineHook(
     }
 }
 
+#if defined(__x86_64__)
+void refreshIndependentNoticeMode() {
+    independentNoticeModeActive =
+        originalApplyRecalledRowState != nullptr &&
+        originalApplyRevokeMessage != nullptr;
+}
+
+void installX86RecalledRowStateInlineHook(
+    const WeChatDylibImage &image,
+    const X86RecalledRowStateHookConfig *config
+) {
+    const uintptr_t entryAddress = image.slide + config->entryOffset;
+    if (!rangeContains(image.start, image.size, entryAddress, x86EntryStubLength) ||
+        !isAddressRangeReadable(reinterpret_cast<const void *>(entryAddress), x86EntryStubLength)) {
+        return;
+    }
+
+    uint8_t entryBytes[x86EntryStubLength];
+    std::memcpy(entryBytes, reinterpret_cast<const void *>(entryAddress), sizeof(entryBytes));
+    const uint64_t slotAddress = decodeX86EntryStubSlot(entryBytes, entryAddress);
+    if (slotAddress == 0 ||
+        !rangeContains(image.start, image.size, slotAddress, sizeof(void *)) ||
+        !isAddressRangeReadable(reinterpret_cast<const void *>(slotAddress), sizeof(void *))) {
+        return;
+    }
+
+    auto **slot = reinterpret_cast<void **>(slotAddress);
+    if (*slot == reinterpret_cast<void *>(&hookedApplyRecalledRowState)) {
+        refreshIndependentNoticeMode();
+        return;
+    }
+
+    size_t trampolineAllocSize = 0;
+    void *trampoline = buildX86InlineTrampoline(
+        config->savedBytes,
+        config->savedByteCount,
+        image.slide + config->continuationOffset,
+        trampolineAllocSize
+    );
+    if (trampoline == nullptr) {
+        return;
+    }
+
+    originalApplyRecalledRowState = reinterpret_cast<ApplyRecalledRowState>(trampoline);
+    if (!writeHookSlot(slot, reinterpret_cast<void *>(&hookedApplyRecalledRowState))) {
+        originalApplyRecalledRowState = nullptr;
+        munmap(trampoline, trampolineAllocSize);
+        return;
+    }
+    refreshIndependentNoticeMode();
+}
+
+void installX86IndependentNoticeInlineHook(
+    const WeChatDylibImage &image,
+    const X86IndependentNoticeHookConfig *config
+) {
+    const uintptr_t entryAddress = image.slide + config->entryOffset;
+    if (!rangeContains(image.start, image.size, entryAddress, x86EntryStubLength) ||
+        !isAddressRangeReadable(reinterpret_cast<const void *>(entryAddress), x86EntryStubLength)) {
+        return;
+    }
+
+    uint8_t entryBytes[x86EntryStubLength];
+    std::memcpy(entryBytes, reinterpret_cast<const void *>(entryAddress), sizeof(entryBytes));
+    const uint64_t slotAddress = decodeX86EntryStubSlot(entryBytes, entryAddress);
+    if (slotAddress == 0 ||
+        !rangeContains(image.start, image.size, slotAddress, sizeof(void *)) ||
+        !isAddressRangeReadable(reinterpret_cast<const void *>(slotAddress), sizeof(void *))) {
+        return;
+    }
+
+    auto **slot = reinterpret_cast<void **>(slotAddress);
+    if (*slot == reinterpret_cast<void *>(&hookedApplyRevokeMessage)) {
+        refreshIndependentNoticeMode();
+        return;
+    }
+
+    size_t trampolineAllocSize = 0;
+    void *trampoline = buildX86InlineTrampoline(
+        config->savedBytes,
+        config->savedByteCount,
+        image.slide + config->continuationOffset,
+        trampolineAllocSize
+    );
+    if (trampoline == nullptr) {
+        return;
+    }
+
+    originalApplyRevokeMessage = reinterpret_cast<ApplyRevokeMessage>(trampoline);
+    if (!writeHookSlot(slot, reinterpret_cast<void *>(&hookedApplyRevokeMessage))) {
+        originalApplyRevokeMessage = nullptr;
+        munmap(trampoline, trampolineAllocSize);
+        return;
+    }
+
+    refreshIndependentNoticeMode();
+}
+#endif
+
 void installRevokeTipHook() {
     WeChatDylibImage image = {};
     if (!findWeChatDylibImage(image)) {
+        if (debugProbeEnabled()) {
+            os_log(OS_LOG_DEFAULT, "[WeChatAntiRecallCombined] init failed: wechat.dylib image not found");
+        }
         return;
     }
 
@@ -2129,6 +2391,22 @@ void installRevokeTipHook() {
     }
     if (const auto *captureConfig = x86InlineMessageCaptureHookConfigForBuild(buildVersion.c_str())) {
         installX86MessageCaptureInlineHook(image, captureConfig);
+    }
+    if (const auto *stateConfig = x86RecalledRowStateHookConfigForBuild(buildVersion.c_str())) {
+        installX86RecalledRowStateInlineHook(image, stateConfig);
+    }
+    if (const auto *noticeConfig = x86IndependentNoticeHookConfigForBuild(buildVersion.c_str())) {
+        installX86IndependentNoticeInlineHook(image, noticeConfig);
+    }
+    if (debugProbeEnabled()) {
+        os_log(
+            OS_LOG_DEFAULT,
+            "[WeChatAntiRecallCombined] init build=%{public}s parser=%{public}s capture=%{public}s independent=%{public}s",
+            buildVersion.c_str(),
+            originalParseRevokeXML == nullptr ? "missing" : "ready",
+            originalFinalizeMessage == nullptr ? "missing" : "ready",
+            independentNoticeModeActive ? "ready" : "missing"
+        );
     }
 #else
     if (const auto *config = revokeHookConfigForBuild(buildVersion.c_str())) {
@@ -2255,6 +2533,59 @@ void wechat_antirecall_capture_received_content_for_test(
     };
     captureReceivedContentPreview(message, &config);
     content->~basic_string();
+}
+
+int wechat_antirecall_x86_64_preserve_and_notice_sequence_selftest(void) {
+#if defined(__x86_64__)
+    const auto savedFinalize = originalFinalizeMessage;
+    const auto savedApply = originalApplyRevokeMessage;
+    const auto savedRowState = originalApplyRecalledRowState;
+    const auto *savedCaptureConfig = activeMessageCaptureHookConfig;
+    const bool savedMode = independentNoticeModeActive;
+    const bool savedPending = pendingIndependentRevokeNotice;
+
+    independentNoticeSequenceFinalizeCalls = 0;
+    independentNoticeSequenceApplyCalls = 0;
+    independentNoticeSequenceRowStateCalls = 0;
+    originalFinalizeMessage = &independentNoticeSequenceFinalizeStub;
+    originalApplyRevokeMessage = &independentNoticeSequenceApplyStub;
+    originalApplyRecalledRowState = &independentNoticeSequenceRowStateStub;
+    activeMessageCaptureHookConfig = nullptr;
+    independentNoticeModeActive = true;
+    // This is the state produced by hookedParseRevokeXML for a remote recall.
+    pendingIndependentRevokeNotice = true;
+
+    // Reproduce the production order: finalizer, recalled-row state write, then
+    // the native availability check. Combined mode must skip only the row mutation
+    // and preserve the normal successful native path.
+    hookedFinalizeMessage(nullptr, 0);
+    const bool survivedFinalizer = pendingIndependentRevokeNotice;
+    hookedApplyRecalledRowState(nullptr, nullptr, false);
+    const bool firstRowStateWasSkipped = independentNoticeSequenceRowStateCalls == 0;
+    const bool nativeAvailabilitySucceeded = hookedApplyRevokeMessage(nullptr, nullptr);
+    const bool consumedAfterAvailability = !pendingIndependentRevokeNotice;
+    hookedApplyRecalledRowState(nullptr, nullptr, false);
+    const bool unrelatedRowStateReachedOriginal = independentNoticeSequenceRowStateCalls == 1;
+
+    const bool passed =
+        independentNoticeSequenceFinalizeCalls == 1 &&
+        survivedFinalizer &&
+        firstRowStateWasSkipped &&
+        nativeAvailabilitySucceeded &&
+        consumedAfterAvailability &&
+        unrelatedRowStateReachedOriginal &&
+        independentNoticeSequenceApplyCalls == 1;
+
+    originalFinalizeMessage = savedFinalize;
+    originalApplyRevokeMessage = savedApply;
+    originalApplyRecalledRowState = savedRowState;
+    activeMessageCaptureHookConfig = savedCaptureConfig;
+    independentNoticeModeActive = savedMode;
+    pendingIndependentRevokeNotice = savedPending;
+    return passed ? 1 : 0;
+#else
+    return 0;
+#endif
 }
 
 

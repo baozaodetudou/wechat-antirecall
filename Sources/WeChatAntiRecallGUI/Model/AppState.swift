@@ -53,6 +53,14 @@ final class AppState: ObservableObject {
 
     var runtimeTipSupported: Bool { versions?.runtimeTipSupported ?? false }
 
+    var preserveWithTipSupported: Bool {
+#if arch(x86_64)
+        return versions?.installedBuildTargets.contains("runtime-preserve-tip") ?? false
+#else
+        return false
+#endif
+    }
+
     var effectiveCatalogSourceIsDownloaded: Bool { BundledPaths.usingDownloadedCatalog }
 
     // MARK: - Refresh
@@ -97,6 +105,15 @@ final class AppState: ObservableObject {
         }
 
         installedMode = nil
+
+        if preserveWithTipSupported,
+           let combinedReport = await dryRunReport(for: InstallRequest(mode: .preserveWithTip)),
+           combinedReport.allEntriesClean,
+           combinedReport.alreadyApplied {
+            installState = .installed
+            installedMode = .preserveWithTip
+            return
+        }
 
         if runtimeTipSupported,
            let customReport = await dryRunReport(for: InstallRequest(mode: .customTip)),
@@ -192,11 +209,13 @@ final class AppState: ObservableObject {
         // A custom-tip install changes additional bytes and injects a runtime dylib. Applying
         // only the silent branch patch on top would leave those pieces behind and create a mixed
         // installation. Force a full backup restore before switching in that direction.
-        if installedMode == .customTip && request.mode == .silent {
+        let leavesCombinedMode = installedMode == .preserveWithTip && request.mode != .preserveWithTip && request.mode != .updateOnly
+        let leavesCustomRuntime = installedMode?.usesCustomTipRuntime == true && request.mode == .silent
+        if leavesCombinedMode || leavesCustomRuntime {
             banner = Banner(
                 kind: .warning,
                 title: "请先恢复再切换模式",
-                message: "当前是「自定义提示」模式。请先到「恢复 / 卸载」还原最近一次备份，再安装「静默防撤回」，避免残留运行时 hook。")
+                message: "当前模式安装了额外的运行时 hook。请先到「恢复 / 卸载」还原最近一次备份，再切换模式，避免残留补丁。")
             return
         }
 
